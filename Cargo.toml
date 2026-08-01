@@ -1,0 +1,34 @@
+[package]
+name          = "ezraft"
+version       = "0.1.0"
+edition       = "2024"
+authors       = ["Zhang Yanpo <drdr.xp@gmail.com>"]
+categories    = ["algorithms", "asynchronous", "data-structures"]
+description   = "A beginner-friendly Raft framework built on openraft"
+documentation = "https://docs.rs/ezraft"
+homepage      = "https://github.com/drmingdrmer/ezraft"
+keywords      = ["raft", "consensus"]
+license       = "MIT OR Apache-2.0"
+readme        = "README.md"
+repository    = "https://github.com/drmingdrmer/ezraft"
+
+[dependencies]
+openraft = { version = "0.10.0-alpha.32", features = ["serde", "type-alias"] }
+
+actix-web   = { version = "4.0" }
+async-trait = { version = "0.1" }
+derive_more = { version = "2.1.1", features = ["display"] }
+futures     = { version = "0.3" }
+reqwest     = { version = "0.12", features = ["json"] }
+serde       = { version = "1.0.114", features = ["derive"] }
+serde_json  = { version = "1.0.57" }
+tokio       = { version = "1.39", default-features = false, features = ["fs", "macros", "rt", "rt-multi-thread", "sync", "time"] }
+tracing     = { version = "0.1.40" }
+
+[dev-dependencies]
+clap               = { version = "4.1.11", features = ["derive", "env"] }
+tracing-subscriber = { version = "0.3.3", features = ["env-filter"] }
+
+[profile.release]
+debug = 2
+split-debuginfo = "packed"

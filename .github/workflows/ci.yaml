@@ -1,0 +1,94 @@
+name: ci
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  schedule: [cron: '40 1 * * *']
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  # Unit tests, plus cluster integration tests that spawn real nodes over HTTP.
+  test:
+    name: test (${{ matrix.toolchain }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    strategy:
+      fail-fast: false
+      matrix:
+        toolchain:
+          - 'stable'
+          - 'nightly'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Pin nightly from rust-toolchain
+        if: matrix.toolchain == 'nightly'
+        run: echo "PIN=$(cat rust-toolchain)" >> "$GITHUB_ENV"
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: ${{ matrix.toolchain == 'nightly' && env.PIN || matrix.toolchain }}
+
+      - name: Test
+        run: cargo test
+        env:
+          RUST_LOG: debug
+          RUST_BACKTRACE: full
+
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # No `toolchain:` input: the action reads ./rust-toolchain, whose pinned
+      # nightly is what rustfmt.toml's unstable options require.
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          components: rustfmt, clippy
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --no-deps --all-targets -- -D warnings
+
+      - name: Build-doc
+        run: cargo doc --all --no-deps
+        env:
+          RUSTDOCFLAGS: '-D warnings'
+
+      - name: Doc tests
+        run: cargo test --doc
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      - name: Audit dependencies
+        run: cargo audit --db ./target/advisory-db
+
+  # Catch packaging breakage (missing files, bad metadata) before a release tag
+  # depends on it.
+  package:
+    name: package
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: Package
+        run: cargo publish --dry-run
