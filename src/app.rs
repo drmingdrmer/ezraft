@@ -93,9 +93,7 @@ pub trait EzApp: Serialize + DeserializeOwned + Send + Sync + 'static {
     /// 404 over HTTP). Answer from your own data structures - an indexed lookup, not a scan of
     /// the serialized state.
     ///
-    /// The default declines every key, so keyed reads are opt-in.
-    fn read(&self, key: &str) -> Option<serde_json::Value> {
-        let _ = key;
-        None
-    }
+    /// An app with nothing to expose this way returns `None` for every key; there is no default,
+    /// so that declining is a decision the app states rather than one it inherits.
+    fn read(&self, key: &str) -> Option<serde_json::Value>;
 }

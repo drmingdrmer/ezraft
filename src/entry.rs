@@ -124,6 +124,10 @@ mod tests {
         async fn apply(&mut self, req: String) -> String {
             req
         }
+
+        fn read(&self, _key: &str) -> Option<serde_json::Value> {
+            None
+        }
     }
 
     #[test]
