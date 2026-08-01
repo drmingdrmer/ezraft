@@ -1,6 +1,6 @@
 [package]
 name          = "ezraft"
-version       = "0.1.0"
+version       = "0.1.1"
 edition       = "2024"
 authors       = ["Zhang Yanpo <drdr.xp@gmail.com>"]
 categories    = ["algorithms", "asynchronous", "data-structures"]
@@ -13,7 +13,11 @@ readme        = "README.md"
 repository    = "https://github.com/drmingdrmer/ezraft"
 
 [dependencies]
-openraft = { version = "0.10.0-alpha.32", features = ["serde", "type-alias"] }
+# Pinned exactly: openraft is a pre-release series that breaks API between
+# alphas, and this crate implements its storage, network and type-config
+# traits. A caret requirement would let a downstream `cargo update` pull an
+# incompatible alpha into a build of ezraft that never changed.
+openraft = { version = "=0.10.0-alpha.32", features = ["serde", "type-alias"] }
 
 actix-web   = { version = "4.0" }
 async-trait = { version = "0.1" }
