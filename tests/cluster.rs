@@ -936,3 +936,77 @@ async fn admin_api_redirects_a_follower_to_the_leader() -> io::Result<()> {
 
     Ok(())
 }
+
+/// A node caught up by a snapshot that has no log entries after it.
+///
+/// This is the one path where the purge openraft runs after installing a
+/// snapshot moves `last_purged` past a `last_log_id` that no later append comes
+/// along to repair. Everywhere else - a joining node, a follower still being
+/// replicated to - entries follow the install and hide it. `save_meta` keeps the
+/// two ordered; without that the node reads back an inverted pair and openraft
+/// refuses to start it, calling the log store corrupted.
+///
+/// The learner joins and only then starts serving, which is what leaves it with
+/// nothing but the snapshot to catch up from: `add_learner` does not wait for
+/// the node it adds, so the leader can compact its whole log first.
+#[tokio::test(flavor = "multi_thread")]
+async fn restart_after_a_snapshot_with_no_log_after_it() -> io::Result<()> {
+    let (addr_a, a) = founding_node().await?;
+
+    // A learner, so `a` keeps a quorum by itself while this node stays dark.
+    let addr_c = free_addr();
+    let disk_c = MemStorage::default();
+    let c = EzRaft::join_as_learner(&addr_c, &addr_a, KvSm::default(), disk_c.clone(), config()).await?;
+
+    for i in 0..10 {
+        a.write(set(&format!("k{}", i), &format!("v{}", i))).await?;
+    }
+
+    // Snapshot at `a`'s last entry and purge everything it covers.
+    a.inner().trigger().snapshot().await.map_err(io::Error::other)?;
+    let snapshot_index = a
+        .inner()
+        .wait(WAIT)
+        .metrics(|m| m.snapshot.is_some(), "snapshot built")
+        .await
+        .map_err(io::Error::other)?
+        .snapshot
+        .unwrap()
+        .index;
+    a.inner().trigger().purge_log(snapshot_index).await.map_err(io::Error::other)?;
+    a.inner()
+        .wait(WAIT)
+        .metrics(
+            |m| m.purged.map(|log_id| log_id.index) == Some(snapshot_index),
+            "log purged up to the snapshot",
+        )
+        .await
+        .map_err(io::Error::other)?;
+    assert_eq!(
+        Some(snapshot_index),
+        a.metrics().await.last_log_index,
+        "the snapshot has to cover the whole log, or an append would follow it"
+    );
+
+    // Only now can the leader reach it, and only a snapshot can catch it up.
+    spawn_serve(&c);
+    wait_for_applied(&c, &a).await?;
+    assert_eq!(expected_map(0..10), c.read(|app| app.data.clone()).await);
+
+    let meta = disk_c.disk.lock().unwrap().meta.clone();
+    assert!(
+        meta.last_purged <= meta.last_log_id,
+        "persisted an inverted log range: last_purged={:?} last_log_id={:?}",
+        meta.last_purged,
+        meta.last_log_id
+    );
+
+    // Opening the store again is the real check: it is where openraft reads
+    // both positions back and refuses an inverted pair. A fresh address because
+    // this node is only constructed, never served.
+    c.inner().shutdown().await.map_err(io::Error::other)?;
+    drop(c);
+    EzRaft::join_as_learner(&free_addr(), &addr_a, KvSm::default(), disk_c, config()).await?;
+
+    Ok(())
+}
