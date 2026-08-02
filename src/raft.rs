@@ -17,9 +17,8 @@ use openraft::errors::InitializeError;
 use openraft::errors::RaftError;
 use tokio::task::JoinHandle;
 
+use crate::admin::AdminClient;
 use crate::admin::MembershipChange;
-use crate::admin::client::request_membership_change;
-use crate::admin::client::request_node_id;
 use crate::app::EzApp;
 use crate::config::EzConfig;
 use crate::network::EzNetworkFactory;
@@ -206,16 +205,18 @@ where T: EzApp
             // learner. Always a learner, whichever role was asked for - a node cannot be added
             // straight to the voter set, because the new configuration's quorum would count a
             // node that is not answering yet, and the change would wait forever on its own ack.
-            let id = request_node_id(seed_addr).await?;
+            let admin = AdminClient::new(seed_addr);
+
+            let id = admin.node_id().await?;
             let enter = MembershipChange::Add {
                 node_id: id,
                 addr: http_addr.clone(),
             };
-            request_membership_change(seed_addr.clone(), enter).await?;
+            admin.membership(enter).await?;
             adapter.save_meta(|m| m.node_id = Some(id)).await?;
 
             if *role == NodeRole::Voter {
-                promote_via = Some(seed_addr.clone());
+                promote_via = Some(admin);
             }
             id
         } else {
@@ -252,13 +253,13 @@ where T: EzApp
 
         // Asking now, answered later. The leader holds the request until this node has caught up,
         // which cannot happen until `serve` is running, so the wait belongs there and not here.
-        let promotion = promote_via.map(|seed_addr| {
+        let promotion = promote_via.map(|admin| {
             let promote = MembershipChange::SetRole {
                 node_id,
                 role: NodeRole::Voter,
             };
 
-            tokio::spawn(request_membership_change(seed_addr, promote))
+            tokio::spawn(async move { admin.membership(promote).await })
         });
 
         Ok(Self {

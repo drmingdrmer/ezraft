@@ -63,6 +63,11 @@ Breaking, in three ways:
 
 New:
 
+- `admin::AdminClient` speaks the admin API - `node_id`, `membership` and
+  `metrics` - from Rust rather than from `curl`, following the redirect to the
+  leader and retrying what a cluster that is still starting up fails at. It is
+  what `EzRaft::join` joins with. Metrics are the exception to both: they are
+  the asked node's own view, so they are neither followed nor retried.
 - `EzRaft::join_as_learner` joins without asking to be promoted, for a read
   replica that costs writes nothing.
 - `EzRaft::promote`, `EzRaft::demote` and `EzRaft::remove_node`. Callable on

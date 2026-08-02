@@ -21,6 +21,7 @@ use ezraft::EzSnapshotMeta;
 use ezraft::EzStorage;
 use ezraft::Loaded;
 use ezraft::Persist;
+use ezraft::admin::AdminClient;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -870,6 +871,34 @@ async fn admin_api_changes_roles_and_removes_nodes() -> io::Result<()> {
         )
         .await
         .map_err(io::Error::other)?;
+
+    Ok(())
+}
+
+/// Metrics are the one admin endpoint no join drives, and the whole
+/// `RaftMetrics` crosses the wire as JSON, so a field that does not survive
+/// the round trip shows up here and nowhere else.
+///
+/// Compared against the same node's in-process metrics, whole: what HTTP
+/// answers is what the node has. A follower is asked on purpose - metrics are
+/// never followed to the leader, and its own view is the point of asking it.
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_client_reads_the_metrics_of_the_node_it_asks() -> io::Result<()> {
+    let (addr_a, a) = founding_node().await?;
+    let (addr_b, b) = joined_voter(&addr_a).await?;
+    wait_for_voters(&a, BTreeSet::from([0, b.node_id()]), "the joining voter is promoted").await?;
+    assert!(!b.is_leader(), "b has to be a follower for this to be its own view");
+
+    // Applied, not merely committed: the two reads below are one after the
+    // other, and a follower still applying the membership entry moves its
+    // `last_applied` between them.
+    wait_for_applied(&b, &a).await?;
+
+    assert_eq!(b.metrics().await, AdminClient::new(&addr_b).metrics::<KvSm>().await?);
+
+    // The same client hands out ids, which is how a joining node gets one.
+    let fresh = AdminClient::new(&addr_a).node_id().await?;
+    assert!(fresh > b.node_id(), "an id past every one handed out so far");
 
     Ok(())
 }

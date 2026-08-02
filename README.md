@@ -305,6 +305,8 @@ EzRaft includes built-in HTTP endpoints:
 - **Application API** (`POST /api/write`): Propose client requests, using your request type as JSON
 - **Application read** (`GET /api/read?key=...`): A keyed read answered by the app's `read` method from local memory, without a consensus round. An unknown key is a 404.
 
+`ezraft::admin::AdminClient` is the admin API from Rust rather than from `curl`: it follows the redirect to the leader and retries what a cluster that is still starting up fails at, which is how `EzRaft::join` joins.
+
 The two application endpoints are a sample, not the API a real service exposes. Copy `EzServer` and replace them with your own routes, built on `EzRaft::write` and `EzRaft::read`. Nothing here is authenticated or encrypted, so keep the addresses on a trusted network.
 
 ## Troubleshooting
