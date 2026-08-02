@@ -45,18 +45,6 @@ use crate::storage::Loaded;
 use crate::storage::Persist;
 use crate::type_config::OpenRaftTypes;
 
-/// Internal storage state protected by single mutex
-pub struct StorageWithCache<T>
-where T: EzApp
-{
-    pub storage: Box<dyn EzStorage<T>>,
-    pub cached_meta: EzMeta,
-
-    /// The snapshot last written or loaded, kept so that serving one to a lagging follower does
-    /// not re-run the startup-only [`EzStorage::load`].
-    pub cached_snapshot: Option<EzSnapshot>,
-}
-
 /// Internal state machine wrapper that tracks Raft metadata
 /// alongside the user's application
 pub struct StateMachineState<T>
@@ -77,10 +65,24 @@ where T: EzApp
 /// Bridges user's `EzApp` and `EzStorage` to OpenRaft's storage traits.
 ///
 /// Only metadata is cached in memory - logs are read from user storage on demand.
+///
+/// Each cache has its own lock, so a read of one never waits on work against another. The
+/// storage itself is the exception: [`EzStorage::persist`] takes `&mut self`, so every write
+/// serializes through it whichever cache it belongs to. **Take a cache before the storage,
+/// never the reverse, and never two caches at once** - that ordering is the whole reason these
+/// cannot deadlock.
 pub struct StorageAdapter<T>
 where T: EzApp
 {
-    pub(crate) storage: Arc<Mutex<StorageWithCache<T>>>,
+    pub(crate) storage: Arc<Mutex<Box<dyn EzStorage<T>>>>,
+
+    /// Raft metadata: the vote, and the positions bounding the log
+    pub(crate) meta: Arc<Mutex<EzMeta>>,
+
+    /// The snapshot last written or loaded, kept so that serving one to a lagging follower does
+    /// not re-run the startup-only [`EzStorage::load`].
+    pub(crate) snapshot: Arc<Mutex<Option<EzSnapshot>>>,
+
     pub(crate) sm_state: Arc<Mutex<StateMachineState<T>>>,
 }
 
@@ -90,10 +92,7 @@ where T: EzApp
     /// Create a new storage adapter and load initial metadata
     pub async fn new(mut user_storage: impl EzStorage<T>, app: T) -> Result<Self, std::io::Error> {
         // Load initial metadata and snapshot
-        let Loaded {
-            meta: cached_meta,
-            snapshot,
-        } = user_storage.load().await?;
+        let Loaded { meta, snapshot } = user_storage.load().await?;
 
         let mut app = app;
 
@@ -110,11 +109,7 @@ where T: EzApp
             None => (None, StoredMembership::new(None, Membership::default())),
         };
 
-        let storage = StorageWithCache {
-            storage: Box::new(user_storage),
-            cached_meta,
-            cached_snapshot: snapshot,
-        };
+        let storage: Box<dyn EzStorage<T>> = Box::new(user_storage);
 
         let sm_state = StateMachineState {
             app,
@@ -124,31 +119,41 @@ where T: EzApp
 
         Ok(Self {
             storage: Arc::new(Mutex::new(storage)),
+            meta: Arc::new(Mutex::new(meta)),
+            snapshot: Arc::new(Mutex::new(snapshot)),
             sm_state: Arc::new(Mutex::new(sm_state)),
         })
     }
 
     /// Update metadata and persist to storage
-    ///
-    /// The log positions are made consistent before anything is written: openraft reads both at
-    /// startup and rejects `last_log_id < last_purged` as a corrupt store. Installing a snapshot
-    /// is what inverts them - the purge that follows moves the purge point past a log that
-    /// stopped short of the snapshot - and keeping the invariant here means no caller has to
-    /// remember it.
     pub async fn save_meta(&self, f: impl FnOnce(&mut EzMeta)) -> Result<(), std::io::Error> {
-        let mut state = self.storage.lock().await;
+        let mut meta = self.meta.lock().await;
+        f(&mut meta);
 
-        f(&mut state.cached_meta);
-        state.cached_meta.last_log_id = state.cached_meta.last_log_id.max(state.cached_meta.last_purged);
-
-        let update = Persist::Meta(state.cached_meta.clone());
-        state.storage.persist(update).await
+        let mut storage = self.storage.lock().await;
+        persist_meta(&mut meta, &mut **storage).await
     }
 
     /// Get the current node_id from cached metadata
     pub async fn node_id(&self) -> Option<u64> {
-        self.storage.lock().await.cached_meta.node_id
+        self.meta.lock().await.node_id
     }
+}
+
+/// Write metadata out, with the log positions made consistent first
+///
+/// openraft reads both positions at startup and rejects `last_log_id < last_purged` as a corrupt
+/// store. Installing a snapshot is what inverts them - the purge that follows moves the purge
+/// point past a log that stopped short of the snapshot - so the repair belongs on the one path
+/// every metadata write takes, not at the call sites.
+///
+/// Takes the two guards rather than the adapter, because most callers already hold both and the
+/// mutex is not reentrant.
+async fn persist_meta<T>(meta: &mut EzMeta, storage: &mut dyn EzStorage<T>) -> Result<(), std::io::Error>
+where T: EzApp {
+    meta.last_log_id = meta.last_log_id.max(meta.last_purged);
+
+    storage.persist(Persist::Meta(meta.clone())).await
 }
 
 // Implement RaftLogStorage for Arc<StorageAdapter>
@@ -158,9 +163,9 @@ where T: EzApp
     type LogReader = Self;
 
     async fn get_log_state(&mut self) -> Result<LogState<OpenRaftTypes<T>>, std::io::Error> {
-        let state = self.storage.lock().await;
-        let last = state.cached_meta.last_log_id.map(|(t, i)| LogId::new_term_index(t, i));
-        let last_purged = state.cached_meta.last_purged.map(|(t, i)| LogId::new_term_index(t, i));
+        let meta = self.meta.lock().await;
+        let last = meta.last_log_id.map(|(t, i)| LogId::new_term_index(t, i));
+        let last_purged = meta.last_purged.map(|(t, i)| LogId::new_term_index(t, i));
 
         Ok(LogState {
             last_log_id: last,
@@ -177,24 +182,24 @@ where T: EzApp
         I: IntoIterator<Item = <OpenRaftTypes<T> as RaftTypeConfig>::Entry> + OptionalSend,
         I::IntoIter: OptionalSend,
     {
-        // One lock for the whole batch and the metadata that describes it, so no reader can
+        // Both locks for the whole batch and the metadata that describes it, so no reader can
         // observe a log that reaches past the last_log_id recorded for it.
         let res = async {
-            let mut state = self.storage.lock().await;
+            let mut meta = self.meta.lock().await;
+            let mut storage = self.storage.lock().await;
 
             let mut last_log_id = None;
 
             // Save all log entries
             for entry in entries {
                 last_log_id = Some(entry.log_id);
-                state.storage.persist(Persist::LogEntry(entry)).await?;
+                storage.persist(Persist::LogEntry(entry)).await?;
             }
 
             // Update metadata once with the last entry's log_id
             if let Some(log_id) = last_log_id {
-                state.cached_meta.last_log_id = Some(log_id);
-                let update = Persist::Meta(state.cached_meta.clone());
-                state.storage.persist(update).await?;
+                meta.last_log_id = Some(log_id);
+                persist_meta(&mut meta, &mut **storage).await?;
             }
 
             Ok::<_, std::io::Error>(())
@@ -217,30 +222,31 @@ where T: EzApp
 
     async fn truncate_after(&mut self, last_log_id: Option<LogIdOf<OpenRaftTypes<T>>>) -> Result<(), std::io::Error> {
         let from = last_log_id.map(|id| id.index).next_index();
-        {
-            let mut state = self.storage.lock().await;
-            state.storage.persist(Persist::DeleteLogs { from, to: u64::MAX }).await?;
-        }
 
-        self.save_meta(|m| {
-            m.last_log_id = last_log_id.map(|id| id.to_type());
-        })
-        .await
+        // Both held across the delete and the position it moves, so no reader sees the log
+        // shrink out from under the last_log_id recorded for it.
+        let mut meta = self.meta.lock().await;
+        let mut storage = self.storage.lock().await;
+
+        storage.persist(Persist::DeleteLogs { from, to: u64::MAX }).await?;
+
+        meta.last_log_id = last_log_id.map(|id| id.to_type());
+        persist_meta(&mut meta, &mut **storage).await
     }
 
     async fn purge(&mut self, log_id: LogIdOf<OpenRaftTypes<T>>) -> Result<(), std::io::Error> {
-        {
-            let mut state = self.storage.lock().await;
-            state
-                .storage
-                .persist(Persist::DeleteLogs {
-                    from: 0,
-                    to: log_id.index + 1,
-                })
-                .await?;
-        }
+        let mut meta = self.meta.lock().await;
+        let mut storage = self.storage.lock().await;
 
-        self.save_meta(|m| m.last_purged = Some(log_id.to_type())).await
+        storage
+            .persist(Persist::DeleteLogs {
+                from: 0,
+                to: log_id.index + 1,
+            })
+            .await?;
+
+        meta.last_purged = Some(log_id.to_type());
+        persist_meta(&mut meta, &mut **storage).await
     }
 
     async fn get_log_reader(&mut self) -> Self::LogReader {
@@ -253,8 +259,7 @@ impl<T> RaftLogReader<OpenRaftTypes<T>> for Arc<StorageAdapter<T>>
 where T: EzApp
 {
     async fn read_vote(&mut self) -> Result<Option<<OpenRaftTypes<T> as RaftTypeConfig>::Vote>, std::io::Error> {
-        let state = self.storage.lock().await;
-        Ok(state.cached_meta.vote)
+        Ok(self.meta.lock().await.vote)
     }
 
     async fn try_get_log_entries<RB>(
@@ -264,13 +269,14 @@ where T: EzApp
     where
         RB: RangeBounds<u64> + Clone + Debug + OptionalSend,
     {
-        // Held until the entries have been read: a purge landing in between would leave the
+        // Both held until the entries have been read: a purge landing in between would leave the
         // clamped range pointing at entries user storage has already deleted.
-        let mut state = self.storage.lock().await;
+        let meta = self.meta.lock().await;
+        let mut storage = self.storage.lock().await;
 
         // Available log range: [lo, hi)
-        let lo = state.cached_meta.last_purged.map(|(_, i)| i).next_index();
-        let hi = state.cached_meta.last_log_id.map(|(_, i)| i).next_index();
+        let lo = meta.last_purged.map(|(_, i)| i).next_index();
+        let hi = meta.last_log_id.map(|(_, i)| i).next_index();
 
         let start = match range.start_bound() {
             std::ops::Bound::Included(&x) => x,
@@ -293,7 +299,7 @@ where T: EzApp
         }
 
         // Load only the requested range from user storage
-        state.storage.read_logs(start, end).await
+        storage.read_logs(start, end).await
     }
 }
 
@@ -360,9 +366,10 @@ where T: EzApp
 
         // Update storage state
         {
-            let mut state = self.storage.lock().await;
-            state.storage.persist(Persist::Snapshot(new_snapshot(snapshot_meta, &data))).await?;
-            state.cached_snapshot = Some(new_snapshot(snapshot_meta, &data));
+            let mut cached = self.snapshot.lock().await;
+            let mut storage = self.storage.lock().await;
+            storage.persist(Persist::Snapshot(new_snapshot(snapshot_meta, &data))).await?;
+            *cached = Some(new_snapshot(snapshot_meta, &data));
         }
 
         // The log positions are not touched here. openraft purges the log up to the snapshot
@@ -380,9 +387,11 @@ where T: EzApp
         Ok(())
     }
 
+    /// Serving a snapshot never touches the storage, so a lagging follower being caught up does
+    /// not queue behind an append.
     async fn get_current_snapshot(&mut self) -> Result<Option<EzSnapshot>, std::io::Error> {
-        let state = self.storage.lock().await;
-        Ok(state.cached_snapshot.as_ref().map(|snap| new_snapshot(&snap.meta, snap.snapshot.get_ref())))
+        let cached = self.snapshot.lock().await;
+        Ok(cached.as_ref().map(|snap| new_snapshot(&snap.meta, snap.snapshot.get_ref())))
     }
 }
 
@@ -414,9 +423,10 @@ where T: EzApp
         // Persist before returning: openraft purges logs covered by this snapshot right after,
         // and a durable purge point with no durable snapshot is an unrecoverable state.
         {
-            let mut state = self.storage.lock().await;
-            state.storage.persist(Persist::Snapshot(new_snapshot(&snapshot_meta, &snapshot_data))).await?;
-            state.cached_snapshot = Some(new_snapshot(&snapshot_meta, &snapshot_data));
+            let mut cached = self.snapshot.lock().await;
+            let mut storage = self.storage.lock().await;
+            storage.persist(Persist::Snapshot(new_snapshot(&snapshot_meta, &snapshot_data))).await?;
+            *cached = Some(new_snapshot(&snapshot_meta, &snapshot_data));
         }
 
         Ok(new_snapshot(&snapshot_meta, &snapshot_data))
