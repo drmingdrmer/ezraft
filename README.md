@@ -263,12 +263,15 @@ yourself for anything past a demo. Its source is the worked example of doing so.
 | `read(\|app\| ...)` | Runs a closure over this node's applied state. No consensus round, no log entry. |
 | `linearizable()` | Leader only: confirms leadership with a quorum round-trip and waits for local state to catch up, so a `read` after it sees every acknowledged write. |
 | `metrics()`, `is_leader()`, `node_id()`, `addr()` | Current node and cluster state. |
-| `promote(node_id)` | Leader only: makes that learner a voter. Returns once it is one, so the call lasts as long as bringing it up to date takes. Fails while another membership change is in flight - a cluster admits one at a time - and on an id that is not a learner. |
-| `demote(node_id)` | Leader only: makes that voter a learner. It keeps receiving the log, it stops being counted in the quorum. Refuses to empty the voter set. |
-| `remove_node(node_id)` | Leader only: takes a node out of the cluster, voter or learner. Does not stop the node's own process. |
-| `change_membership(change)` | Membership changes beyond these, expressed as openraft's `ChangeMembers`. |
+| `promote(node_id)` | Makes that learner a voter. Returns once it is one, so the call lasts as long as bringing it up to date takes. Fails while another membership change is in flight - a cluster admits one at a time - and on an id that is not a learner. |
+| `demote(node_id)` | Makes that voter a learner. It keeps receiving the log, it stops being counted in the quorum. Refuses to empty the voter set. |
+| `remove_node(node_id)` | Takes a node out of the cluster, voter or learner. Does not stop the node's own process. |
 | `serve()` | Runs the HTTP server, and collects the promotion a `join` started - so a joining node must call it, and a promotion that fails is returned from here. Blocks, so spawn it - `tokio::spawn(raft.clone().serve())` - and start it early: peers reach a node only through this server. |
 | `inner()` | The openraft `Raft` underneath, for anything EzRaft does not wrap. |
+
+Only a leader can change membership, but `promote`, `demote` and `remove_node` are
+callable on any node: a follower forwards to the leader over HTTP and returns its answer,
+the way `write` does. A moment with no leader at all is waited out rather than returned.
 
 Every fallible method returns `std::io::Error`, including the ones that fail for reasons
 that have nothing to do with I/O: a caller cannot usefully branch on the difference, since
@@ -296,7 +299,7 @@ Most users can use `EzConfig::default()`.
 EzRaft includes built-in HTTP endpoints:
 
 - **Raft RPC** (`/raft/*`): Internal consensus communication
-- **Admin API** (`/api/node_id`, `/api/add_node`, `/api/change_node_role`, `/api/remove_node`, `/api/change_membership`, `/api/metrics`): joining is the first three - take an id, enter the membership as a learner, then ask for the voter role. `change_node_role` is one endpoint for both directions, because promoting and demoting are one decision: whether the node counts towards a quorum. Each answers either the result or the address of the leader to ask instead.
+- **Admin API** (`/api/node_id`, `/api/add_node`, `/api/change_node_role`, `/api/remove_node`, `/api/metrics`): joining is the first three - take an id, enter the membership as a learner, then ask for the voter role. `change_node_role` is one endpoint for both directions, because promoting and demoting are one decision: whether the node counts towards a quorum. Each answers either the result or the address of the leader to ask instead.
 - **Application API** (`POST /api/write`): Propose client requests, using your request type as JSON
 - **Application read** (`GET /api/read?key=...`): A keyed read answered by the app's `read` method from local memory, without a consensus round. An unknown key is a 404.
 

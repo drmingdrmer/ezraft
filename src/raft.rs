@@ -17,9 +17,13 @@ use openraft::async_runtime::WatchReceiver;
 use openraft::errors::ClientWriteError;
 use openraft::errors::InitializeError;
 use openraft::errors::RaftError;
+use serde::Serialize;
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
 
+use crate::admin::ChangeNodeRoleRequest;
+use crate::admin::RemoveNodeRequest;
+use crate::admin::client::forward_admin;
 use crate::admin::client::request_add_node;
 use crate::admin::client::request_change_node_role;
 use crate::admin::client::request_node_id;
@@ -391,10 +395,15 @@ where T: EzApp
     /// Fails if the node is not a learner of this cluster, and if another membership change is
     /// still in flight, since a cluster admits one at a time. Both are the caller's to retry -
     /// on the joining path that is [`Self::join`]'s promotion request, which retries like every
-    /// other request it makes. Only a leader can change membership and this does not forward, so
-    /// call it on the leader.
+    /// other request it makes. Callable on any node: a follower forwards to the leader.
     pub async fn promote(&self, node_id: u64) -> Result<(), io::Error> {
-        self.change_membership(ChangeMembers::AddVoterIds(BTreeSet::from([node_id]))).await
+        let change = ChangeMembers::AddVoterIds(BTreeSet::from([node_id]));
+        let forward = ChangeNodeRoleRequest {
+            node_id,
+            role: NodeRole::Voter,
+        };
+
+        self.change_members(change, false, "change_node_role", &forward).await
     }
 
     /// Make a voter a learner
@@ -411,16 +420,17 @@ where T: EzApp
     /// Demoting the current leader is allowed. It commits the change and then steps down, and the
     /// remaining voters elect one of their own.
     ///
-    /// Only a leader can change membership and this does not forward, so call it on the leader.
+    /// Callable on any node: a follower forwards to the leader.
     pub async fn demote(&self, node_id: u64) -> Result<(), io::Error> {
         // `retain` is what makes this a demotion rather than a removal: the node stays in the
         // membership, as a learner.
-        self.raft
-            .change_membership(ChangeMembers::RemoveVoters(BTreeSet::from([node_id])), true)
-            .await
-            .map_err(|e| io::Error::other(e.to_string()))?;
+        let change = ChangeMembers::RemoveVoters(BTreeSet::from([node_id]));
+        let forward = ChangeNodeRoleRequest {
+            node_id,
+            role: NodeRole::Learner,
+        };
 
-        Ok(())
+        self.change_members(change, true, "change_node_role", &forward).await
     }
 
     /// Take a node out of the cluster
@@ -433,34 +443,76 @@ where T: EzApp
     /// what leaves the cluster nothing to talk to; a node removed while still running keeps
     /// serving stale reads to anyone who asks it.
     ///
-    /// Only a leader can change membership and this does not forward, so call it on the leader.
+    /// Callable on any node: a follower forwards to the leader.
     pub async fn remove_node(&self, node_id: u64) -> Result<(), io::Error> {
         let metrics = self.metrics().await;
         let node = BTreeSet::from([node_id]);
+        let forward = RemoveNodeRequest { node_id };
 
         // A voter and a learner are removed differently, because a voter is in two places at
         // once. Taking it out of the voter set with `retain` off drops its node entry too, but
         // only once the joint config that still counts it has resolved - dropping that entry any
         // sooner would leave the joint config holding a voter with no address to reach it at. A
         // learner is in no config, so its entry is all there is to drop.
-        if metrics.membership_config.membership().voter_ids().any(|id| id == node_id) {
-            self.raft
-                .change_membership(ChangeMembers::RemoveVoters(node), false)
-                .await
-                .map_err(|e| io::Error::other(e.to_string()))?;
+        //
+        // Deciding from this node's membership is safe even when this node is not the leader: it
+        // decides only which change to attempt locally, and that attempt is what discovers there
+        // is a leader elsewhere. What crosses the wire is the request above, which the leader
+        // resolves against its own membership.
+        let change = if metrics.membership_config.membership().voter_ids().any(|id| id == node_id) {
+            ChangeMembers::RemoveVoters(node)
+        } else {
+            ChangeMembers::RemoveNodes(node)
+        };
 
-            return Ok(());
-        }
-
-        self.change_membership(ChangeMembers::RemoveNodes(node)).await
+        self.change_members(change, false, "remove_node", &forward).await
     }
 
-    /// Change the cluster membership
+    /// Make a membership change, on the leader wherever it is
     ///
-    /// This modifies the cluster membership using OpenRaft's `ChangeMembers`.
-    pub async fn change_membership(&self, change: ChangeMembers<u64, BasicNode>) -> Result<(), io::Error> {
-        self.raft.change_membership(change, false).await.map_err(|e| io::Error::other(e.to_string()))?;
-        Ok(())
+    /// Mirrors [`Self::write`]: attempted here, forwarded over HTTP when this node turns out not
+    /// to be the leader, and waited out while the cluster has none. What crosses the wire is
+    /// `endpoint` and `forward` - the caller's intent, not this node's resolution of it - so the
+    /// leader decides from its own membership rather than from a follower's older copy of it.
+    ///
+    /// Only the leaderless moment is retried. A change the leader refuses - another one already in
+    /// flight, a node that is not a learner - comes straight back to the caller.
+    async fn change_members(
+        &self,
+        change: ChangeMembers<u64, BasicNode>,
+        retain: bool,
+        endpoint: &str,
+        forward: &impl Serialize,
+    ) -> Result<(), io::Error> {
+        let mut last_err = String::new();
+
+        for _ in 0..WRITE_ATTEMPTS {
+            let err = match self.raft.change_membership(change.clone(), retain).await {
+                Ok(_) => return Ok(()),
+                Err(e) => e,
+            };
+
+            let RaftError::APIError(ClientWriteError::ForwardToLeader(to_leader)) = &err else {
+                return Err(io::Error::other(err.to_string()));
+            };
+
+            // Forwarding to ourselves would repeat this call over HTTP forever.
+            match to_leader.leader_node.as_ref().map(|n| n.addr.as_str()) {
+                Some(leader) if leader != self.addr => return forward_admin(leader, endpoint, forward).await,
+                // No usable leader: an election is in flight, or a just-elected leader has not
+                // confirmed its quorum lease yet. Both resolve within heartbeats, so wait them
+                // out instead of bothering the caller.
+                _ => {
+                    last_err = err.to_string();
+                    sleep(WRITE_RETRY_INTERVAL).await;
+                }
+            }
+        }
+
+        Err(io::Error::other(format!(
+            "{} gave up after {} attempts: {}",
+            endpoint, WRITE_ATTEMPTS, last_err
+        )))
     }
 
     /// Check if this node is the leader

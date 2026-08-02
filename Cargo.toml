@@ -27,7 +27,6 @@ reqwest     = { version = "0.12", features = ["json"] }
 serde       = { version = "1.0.114", features = ["derive"] }
 serde_json  = { version = "1.0.57" }
 tokio       = { version = "1.39", default-features = false, features = ["fs", "macros", "rt", "rt-multi-thread", "sync", "time"] }
-tracing     = { version = "0.1.40" }
 
 [dev-dependencies]
 clap               = { version = "4.1.11", features = ["derive", "env"] }

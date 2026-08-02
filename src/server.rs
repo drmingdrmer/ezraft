@@ -2,7 +2,7 @@
 //!
 //! This module provides the HTTP server that handles:
 //! - Internal Raft RPC (append entries, vote)
-//! - Admin API (join, change membership, metrics)
+//! - Admin API (joining, node roles, removal, metrics)
 
 use std::io::Cursor;
 
@@ -10,8 +10,6 @@ use actix_web::App;
 use actix_web::HttpServer;
 use actix_web::web;
 use actix_web::web::Data;
-use openraft::BasicNode;
-use openraft::ChangeMembers;
 use openraft::Snapshot;
 use openraft::errors::Infallible;
 use openraft::errors::decompose::DecomposeResult;
@@ -77,7 +75,6 @@ where T: EzApp
                 .route("/api/add_node", web::post().to(Self::handle_add_node))
                 .route("/api/change_node_role", web::post().to(Self::handle_change_node_role))
                 .route("/api/remove_node", web::post().to(Self::handle_remove_node))
-                .route("/api/change_membership", web::post().to(Self::handle_change_membership))
                 .route("/api/metrics", web::get().to(Self::handle_metrics))
         })
         .bind(&addr)?;
@@ -201,19 +198,6 @@ where T: EzApp
         Ok(web::Json(value))
     }
 
-    /// Change membership API handler
-    async fn handle_change_membership(
-        req: web::Json<ChangeMembers<u64, BasicNode>>,
-        ez: Data<Self>,
-    ) -> Result<web::Json<serde_json::Value>, actix_web::Error> {
-        ez.raft
-            .change_membership(req.into_inner())
-            .await
-            .map_err(|e| actix_web::error::ErrorInternalServerError(format!("change_membership failed: {}", e)))?;
-
-        Ok(web::Json(serde_json::json!({ "status": "ok" })))
-    }
-
     /// Metrics API handler
     async fn handle_metrics(ez: Data<Self>) -> Result<web::Json<openraft::RaftMetrics<C<T>>>, actix_web::Error> {
         let metrics = ez.raft.metrics().await;
@@ -246,9 +230,9 @@ where T: EzApp
     /// Add node API handler
     ///
     /// Adds a node to the membership as a learner, which replicates the log without voting.
-    /// Making it a voter is [`Self::handle_promote`], and separate for a reason: a node added
-    /// straight to the voter set would be counted in the new configuration's quorum before it
-    /// could answer anything, and the change would wait forever on its own acknowledgement.
+    /// Making it a voter is [`Self::handle_change_node_role`], and separate for a reason: a node
+    /// added straight to the voter set would be counted in the new configuration's quorum before
+    /// it could answer anything, and the change would wait forever on its own acknowledgement.
     async fn handle_add_node(
         req: web::Json<AddNodeRequest>,
         ez: Data<Self>,

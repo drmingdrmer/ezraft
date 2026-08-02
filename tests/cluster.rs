@@ -846,3 +846,49 @@ async fn admin_api_changes_roles_and_removes_nodes() -> io::Result<()> {
 
     Ok(())
 }
+
+/// The membership methods must work when called on a follower, forwarding to
+/// the leader the way `write` does, so a caller never has to find the leader
+/// first. Every change below is asked of `b`, and asserted on `a`.
+#[tokio::test(flavor = "multi_thread")]
+async fn membership_changes_forward_from_a_follower() -> io::Result<()> {
+    let (addr_a, a) = founding_node().await?;
+    let (_, b) = joined_voter(&addr_a).await?;
+    let (_, c) = joined_learner(&addr_a).await?;
+    let c_id = c.node_id();
+
+    wait_for_voters(&a, BTreeSet::from([0, b.node_id()]), "the joining voter is promoted").await?;
+
+    // Without this the test could pass by asking the leader after all.
+    assert!(!b.is_leader(), "b has to be a follower to be forwarding anything");
+
+    b.promote(c_id).await?;
+    wait_for_voters(
+        &a,
+        BTreeSet::from([0, b.node_id(), c_id]),
+        "the follower's promote reached the leader",
+    )
+    .await?;
+
+    b.demote(c_id).await?;
+    wait_for_voters(
+        &a,
+        BTreeSet::from([0, b.node_id()]),
+        "the follower's demote reached the leader",
+    )
+    .await?;
+
+    // `remove_node` picks its change from the caller's own membership, so this
+    // one also covers a follower whose copy may lag the demotion just made.
+    b.remove_node(c_id).await?;
+    a.inner()
+        .wait(WAIT)
+        .metrics(
+            |m| m.membership_config.membership().get_node(&c_id).is_none(),
+            "the follower's remove reached the leader",
+        )
+        .await
+        .map_err(io::Error::other)?;
+
+    Ok(())
+}

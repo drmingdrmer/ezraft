@@ -12,6 +12,9 @@
 //!
 //! # Terminal 3 (joins via seed node)
 //! cargo run --example kvstore -- --addr 127.0.0.1:8082 --seed 127.0.0.1:8080
+//!
+//! # A read replica: replicates the log, never votes, and writes never wait for it
+//! cargo run --example kvstore -- --addr 127.0.0.1:8083 --seed 127.0.0.1:8080 --learner
 //! ```
 //!
 //! Then drive it through the write API, which takes the `Request` type below as JSON,
@@ -102,6 +105,13 @@ struct Args {
     /// Seed node address to join existing cluster
     #[arg(long)]
     seed: Option<String>,
+
+    /// Join as a learner: replicate the log and answer reads, but never vote
+    ///
+    /// Adds read capacity without adding a node that writes have to wait for. Promote it with
+    /// `POST /api/change_node_role` whenever you decide to.
+    #[arg(long)]
+    learner: bool,
 }
 
 #[tokio::main]
@@ -120,6 +130,14 @@ async fn main() -> io::Result<()> {
     let addr = args.addr;
     let seed = args.seed;
 
+    // The founding node is the cluster's first voter and cannot be anything else: a cluster whose
+    // only member does not vote can never commit, not even the change that would fix it.
+    if args.learner && seed.is_none() {
+        return Err(io::Error::other(
+            "--learner needs --seed: the founding node has to be a voter",
+        ));
+    }
+
     // Create app and storage (use addr for directory name)
     let base_dir = PathBuf::from(format!("./data/{}", addr.replace(':', "-")));
 
@@ -131,6 +149,7 @@ async fn main() -> io::Result<()> {
     // Create EzRaft instance: the first node starts the cluster, the rest join it
     let config = EzConfig::default();
     let raft = match &seed {
+        Some(seed) if args.learner => EzRaft::join_as_learner(&addr, seed, app, storage, config).await?,
         Some(seed) => EzRaft::join(&addr, seed, app, storage, config).await?,
         None => EzRaft::create(&addr, app, storage, config).await?,
     };
@@ -172,6 +191,10 @@ Read it back - answered from this node's memory, no consensus round:
 
 Cluster state - leader, term, log index, membership:
     curl {addr}/api/metrics
+
+Change a node's role - a voter counts towards a quorum, a learner does not:
+    curl -X POST {addr}/api/change_node_role -H 'Content-Type: application/json' \
+        -d '{{"node_id": 1, "role": "Voter"}}'
 "#
     );
 }

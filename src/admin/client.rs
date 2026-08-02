@@ -21,11 +21,11 @@ const ADMIN_RETRY_INTERVAL: Duration = Duration::from_millis(500);
 /// How long a single admin request may take before the target is given up on
 const ADMIN_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// How long a role change may take before the leader is given up on
+/// How long a membership change may take before the leader is given up on
 ///
 /// Far longer than the rest, because the leader answers only once the change is committed, and
 /// bringing a new voter up to date is part of that - for a large state, a whole snapshot transfer.
-const ROLE_CHANGE_TIMEOUT: Duration = Duration::from_secs(90);
+const MEMBERSHIP_CHANGE_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// Take a fresh node id from the cluster
 pub(crate) async fn request_node_id(seed_addr: &str) -> Result<u64, io::Error> {
@@ -48,7 +48,30 @@ pub(crate) async fn request_add_node(seed_addr: &str, node_id: u64, my_addr: &st
 /// [`EzRaft::serve`](crate::EzRaft::serve) is that place.
 pub(crate) async fn request_change_node_role(seed_addr: String, node_id: u64, role: NodeRole) -> Result<(), io::Error> {
     let req = ChangeNodeRoleRequest { node_id, role };
-    admin_request(&seed_addr, "change_node_role", &req, ROLE_CHANGE_TIMEOUT).await
+    admin_request(&seed_addr, "change_node_role", &req, MEMBERSHIP_CHANGE_TIMEOUT).await
+}
+
+/// Hand a request to the node this one believes to be the leader
+///
+/// How a membership method called on a follower reaches the leader, the way a write forwards. One
+/// attempt, because the caller already asked Raft which node leads: a redirect back means that
+/// answer went stale between the two calls, which is a failure to report rather than a chase to
+/// start - the caller knows how to ask Raft again.
+pub(crate) async fn forward_admin<Req>(leader_addr: &str, endpoint: &str, req: &Req) -> Result<(), io::Error>
+where Req: Serialize {
+    let client = client(MEMBERSHIP_CHANGE_TIMEOUT)?;
+
+    match admin_attempt::<_, ()>(&client, leader_addr, endpoint, req).await? {
+        Ok(()) => Ok(()),
+        Err(Some(leader)) => Err(io::Error::other(format!(
+            "forwarded {} to {}, which no longer leads - {} does",
+            endpoint, leader_addr, leader
+        ))),
+        Err(None) => Err(io::Error::other(format!(
+            "forwarded {} to {}, which no longer leads and knows of no leader",
+            endpoint, leader_addr
+        ))),
+    }
 }
 
 /// Drive one admin endpoint to an answer
@@ -67,50 +90,31 @@ where
     Req: Serialize,
     Resp: DeserializeOwned,
 {
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .timeout(timeout)
-        .build()
-        .map_err(|e| io::Error::other(e.to_string()))?;
+    let client = client(timeout)?;
 
     let mut target_addr = seed_addr.to_string();
     let mut last_err = format!("cluster did not answer {}", endpoint);
 
     for _ in 0..ADMIN_ATTEMPTS {
-        let url = format!("http://{}/api/{}", target_addr, endpoint);
-
-        // A send failure is as transient as the rest: the seed may still be binding its HTTP
-        // socket, since serving starts concurrently with cluster formation.
-        let resp = match client.post(&url).json(req).send().await {
-            Ok(resp) => resp,
+        // Every way an attempt can fail is as transient as the rest here: the seed may still be
+        // binding its HTTP socket, since serving starts concurrently with cluster formation.
+        let redirect = match admin_attempt(&client, &target_addr, endpoint, req).await {
+            Ok(redirect) => redirect,
             Err(e) => {
-                last_err = format!("request to {} failed: {}", url, e);
+                last_err = e.to_string();
                 sleep(ADMIN_RETRY_INTERVAL).await;
                 continue;
             }
         };
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            last_err = format!("{} responded {}: {}", url, status, body);
-            sleep(ADMIN_RETRY_INTERVAL).await;
-            continue;
-        }
-
-        let redirect: Redirect<Resp> = resp
-            .json()
-            .await
-            .map_err(|e| io::Error::other(format!("failed to parse {} response: {}", url, e)))?;
-
         match redirect {
             Ok(resp) => return Ok(resp),
             Err(Some(leader)) => {
-                last_err = format!("{} redirected to {}", url, leader);
+                last_err = format!("{} redirected to {}", target_addr, leader);
                 target_addr = leader;
             }
             Err(None) => {
-                last_err = format!("{} knows of no leader", url);
+                last_err = format!("{} knows of no leader", target_addr);
                 sleep(ADMIN_RETRY_INTERVAL).await;
             }
         }
@@ -120,4 +124,48 @@ where
         "{} gave up after {} attempts: {}",
         endpoint, ADMIN_ATTEMPTS, last_err
     )))
+}
+
+/// One POST to one admin endpoint, and what it answered
+///
+/// Errors on anything that is not an admin answer - an unreachable node, a non-success status, a
+/// body that will not parse - and leaves it to the caller whether that is worth another attempt.
+async fn admin_attempt<Req, Resp>(
+    client: &reqwest::Client,
+    addr: &str,
+    endpoint: &str,
+    req: &Req,
+) -> Result<Redirect<Resp>, io::Error>
+where
+    Req: Serialize,
+    Resp: DeserializeOwned,
+{
+    let url = format!("http://{}/api/{}", addr, endpoint);
+
+    let resp = client
+        .post(&url)
+        .json(req)
+        .send()
+        .await
+        .map_err(|e| io::Error::other(format!("request to {} failed: {}", url, e)))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(io::Error::other(format!("{} responded {}: {}", url, status, body)));
+    }
+
+    resp.json().await.map_err(|e| io::Error::other(format!("failed to parse {} response: {}", url, e)))
+}
+
+/// An HTTP client for one admin exchange
+///
+/// `no_proxy` because these addresses are cluster-internal: a proxy configured for outbound
+/// traffic would swallow a request meant for a peer on the same network.
+fn client(timeout: Duration) -> Result<reqwest::Client, io::Error> {
+    reqwest::Client::builder()
+        .no_proxy()
+        .timeout(timeout)
+        .build()
+        .map_err(|e| io::Error::other(e.to_string()))
 }
