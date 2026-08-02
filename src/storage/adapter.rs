@@ -60,71 +60,119 @@ where T: EzApp
     pub membership: StoredMembershipOf<OpenRaftTypes<T>>,
 }
 
-/// Internal storage adapter
+/// The user's storage, reached by both stores
 ///
-/// Bridges user's `EzApp` and `EzStorage` to OpenRaft's storage traits.
+/// Shared only because [`EzStorage::persist`] takes `&mut self`, so every write serializes
+/// through it whichever store makes it. **Take a store's own cache before this, never the
+/// reverse, and never two caches at once** - that ordering is the whole reason these cannot
+/// deadlock.
+type SharedStorage<T> = Arc<Mutex<Box<dyn EzStorage<T>>>>;
+
+/// The log: entries, and the metadata that bounds them
 ///
-/// Only metadata is cached in memory - logs are read from user storage on demand.
-///
-/// Each cache has its own lock, so a read of one never waits on work against another. The
-/// storage itself is the exception: [`EzStorage::persist`] takes `&mut self`, so every write
-/// serializes through it whichever cache it belongs to. **Take a cache before the storage,
-/// never the reverse, and never two caches at once** - that ordering is the whole reason these
-/// cannot deadlock.
-pub struct StorageAdapter<T>
+/// Only metadata is cached in memory - entries are read from user storage on demand.
+pub struct LogStore<T>
 where T: EzApp
 {
-    pub(crate) storage: Arc<Mutex<Box<dyn EzStorage<T>>>>,
+    pub(crate) storage: SharedStorage<T>,
 
     /// Raft metadata: the vote, and the positions bounding the log
     pub(crate) meta: Arc<Mutex<EzMeta>>,
+}
+
+/// The state machine: the user's application, what it has applied, and its snapshot
+pub struct StateMachineStore<T>
+where T: EzApp
+{
+    pub(crate) storage: SharedStorage<T>,
+
+    pub(crate) sm_state: Arc<Mutex<StateMachineState<T>>>,
 
     /// The snapshot last written or loaded, kept so that serving one to a lagging follower does
     /// not re-run the startup-only [`EzStorage::load`].
     pub(crate) snapshot: Arc<Mutex<Option<EzSnapshot>>>,
-
-    pub(crate) sm_state: Arc<Mutex<StateMachineState<T>>>,
 }
 
-impl<T> StorageAdapter<T>
+// Hand-written, because deriving would demand `T: Clone` of an application that has no reason
+// to be cloneable. Both stores are handles: cloning one shares its state.
+impl<T> Clone for LogStore<T>
 where T: EzApp
 {
-    /// Create a new storage adapter and load initial metadata
-    pub async fn new(mut user_storage: impl EzStorage<T>, app: T) -> Result<Self, std::io::Error> {
-        // Load initial metadata and snapshot
-        let Loaded { meta, snapshot } = user_storage.load().await?;
-
-        let mut app = app;
-
-        // Initialize state machine state from snapshot or defaults.
-        //
-        // The snapshot data must be restored here, not just its position: reporting
-        // `last_applied` at the snapshot makes openraft re-apply only the log tail after it, and
-        // skip installing this snapshot itself.
-        let (last_applied, last_membership) = match &snapshot {
-            Some(snap) => {
-                app = serde_json::from_slice(snap.snapshot.get_ref())?;
-                (snap.meta.last_log_id, snap.meta.last_membership.clone())
-            }
-            None => (None, StoredMembership::new(None, Membership::default())),
-        };
-
-        let storage: Box<dyn EzStorage<T>> = Box::new(user_storage);
-
-        let sm_state = StateMachineState {
-            app,
-            last_applied,
-            membership: last_membership,
-        };
-
-        Ok(Self {
-            storage: Arc::new(Mutex::new(storage)),
-            meta: Arc::new(Mutex::new(meta)),
-            snapshot: Arc::new(Mutex::new(snapshot)),
-            sm_state: Arc::new(Mutex::new(sm_state)),
-        })
+    fn clone(&self) -> Self {
+        Self {
+            storage: self.storage.clone(),
+            meta: self.meta.clone(),
+        }
     }
+}
 
+impl<T> Clone for StateMachineStore<T>
+where T: EzApp
+{
+    fn clone(&self) -> Self {
+        Self {
+            storage: self.storage.clone(),
+            sm_state: self.sm_state.clone(),
+            snapshot: self.snapshot.clone(),
+        }
+    }
+}
+
+/// Open the user's storage as the two stores openraft asks for
+///
+/// One [`EzStorage::load`], because there is one storage behind both: the metadata it returns
+/// belongs to the log, the snapshot to the state machine.
+pub async fn open<T>(
+    mut user_storage: impl EzStorage<T>,
+    app: T,
+) -> Result<(LogStore<T>, StateMachineStore<T>), std::io::Error>
+where
+    T: EzApp,
+{
+    // Load initial metadata and snapshot
+    let Loaded { meta, snapshot } = user_storage.load().await?;
+
+    let mut app = app;
+
+    // Initialize state machine state from snapshot or defaults.
+    //
+    // The snapshot data must be restored here, not just its position: reporting
+    // `last_applied` at the snapshot makes openraft re-apply only the log tail after it, and
+    // skip installing this snapshot itself.
+    let (last_applied, last_membership) = match &snapshot {
+        Some(snap) => {
+            app = serde_json::from_slice(snap.snapshot.get_ref())?;
+            (snap.meta.last_log_id, snap.meta.last_membership.clone())
+        }
+        None => (None, StoredMembership::new(None, Membership::default())),
+    };
+
+    let storage: Box<dyn EzStorage<T>> = Box::new(user_storage);
+    let storage: SharedStorage<T> = Arc::new(Mutex::new(storage));
+
+    let sm_state = StateMachineState {
+        app,
+        last_applied,
+        membership: last_membership,
+    };
+
+    let log = LogStore {
+        storage: storage.clone(),
+        meta: Arc::new(Mutex::new(meta)),
+    };
+
+    let sm = StateMachineStore {
+        storage,
+        sm_state: Arc::new(Mutex::new(sm_state)),
+        snapshot: Arc::new(Mutex::new(snapshot)),
+    };
+
+    Ok((log, sm))
+}
+
+impl<T> LogStore<T>
+where T: EzApp
+{
     /// Update metadata and persist to storage
     pub async fn save_meta(&self, f: impl FnOnce(&mut EzMeta)) -> Result<(), std::io::Error> {
         let mut meta = self.meta.lock().await;
@@ -156,8 +204,7 @@ where T: EzApp {
     storage.persist(Persist::Meta(meta.clone())).await
 }
 
-// Implement RaftLogStorage for Arc<StorageAdapter>
-impl<T> RaftLogStorage<OpenRaftTypes<T>> for Arc<StorageAdapter<T>>
+impl<T> RaftLogStorage<OpenRaftTypes<T>> for LogStore<T>
 where T: EzApp
 {
     type LogReader = Self;
@@ -254,8 +301,7 @@ where T: EzApp
     }
 }
 
-// Implement RaftLogReader for Arc<StorageAdapter>
-impl<T> RaftLogReader<OpenRaftTypes<T>> for Arc<StorageAdapter<T>>
+impl<T> RaftLogReader<OpenRaftTypes<T>> for LogStore<T>
 where T: EzApp
 {
     async fn read_vote(&mut self) -> Result<Option<<OpenRaftTypes<T> as RaftTypeConfig>::Vote>, std::io::Error> {
@@ -303,8 +349,7 @@ where T: EzApp
     }
 }
 
-// Implement RaftStateMachine for Arc<StorageAdapter>
-impl<T> RaftStateMachine<OpenRaftTypes<T>> for Arc<StorageAdapter<T>>
+impl<T> RaftStateMachine<OpenRaftTypes<T>> for StateMachineStore<T>
 where T: EzApp
 {
     type SnapshotData = EzSnapshotData;
@@ -395,8 +440,7 @@ where T: EzApp
     }
 }
 
-// Implement RaftSnapshotBuilder for Arc<StorageAdapter>
-impl<T> RaftSnapshotBuilder<OpenRaftTypes<T>> for Arc<StorageAdapter<T>>
+impl<T> RaftSnapshotBuilder<OpenRaftTypes<T>> for StateMachineStore<T>
 where T: EzApp
 {
     type SnapshotData = EzSnapshotData;

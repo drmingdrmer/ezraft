@@ -5,7 +5,7 @@
 Learner support. A node can join and stay a learner, and any member can be
 moved between voter and learner or taken out of the cluster.
 
-Breaking, in three ways:
+Breaking, in four ways:
 
 - `POST /api/join` is gone, replaced by `POST /api/node_id` and
   `POST /api/membership`. Taking an id is split from changing the membership
@@ -52,6 +52,13 @@ Breaking, in three ways:
 
       // reach the cluster through its front door instead
       POST http://<any-node>/api/write
+
+- `StorageAdapter` is gone, split into `storage::adapter::LogStore` and
+  `storage::adapter::StateMachineStore` - the two stores openraft asks for,
+  which one type used to serve by implementing all four storage traits and
+  being passed twice. `ORRaft`, which `EzRaft::inner` returns, is now
+  `Raft<OpenRaftTypes<T>, StateMachineStore<T>>`. Code that only calls methods
+  on `EzRaft::inner()` is unaffected; code that names the type is not.
 
 - A node created with `EzRaft::join` must now call `EzRaft::serve`. `join`
   starts the promotion to voter and `serve` collects it, because the leader

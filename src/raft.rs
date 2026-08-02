@@ -24,14 +24,20 @@ use crate::config::EzConfig;
 use crate::network::EzNetworkFactory;
 use crate::node_role::NodeRole;
 use crate::storage::EzStorage;
-use crate::storage::adapter::StorageAdapter;
+use crate::storage::adapter::LogStore;
+use crate::storage::adapter::StateMachineStore;
+use crate::storage::adapter::open;
 use crate::type_config::OpenRaftTypes;
 
 /// Type alias for OpenRaft types (more readable than `OpenRaftTypes<T>`)
 type ORTypes<T> = OpenRaftTypes<T>;
 
-/// The internal OpenRaft instance, with EzRaft's storage adapter as its state machine
-pub type ORRaft<T> = Raft<ORTypes<T>, Arc<StorageAdapter<T>>>;
+/// The internal OpenRaft instance, with EzRaft's state machine behind it
+///
+/// Only the state machine appears in the type: openraft carries it as a parameter because the
+/// snapshot builder is bound to it, while the log store is passed to `Raft::new` and kept
+/// behind the scenes.
+pub type ORRaft<T> = Raft<ORTypes<T>, StateMachineStore<T>>;
 
 /// A promotion in flight, handed from [`EzRaft::join`] to [`EzRaft::serve`]
 type Promotion = Arc<Mutex<Option<JoinHandle<Result<(), io::Error>>>>>;
@@ -54,8 +60,11 @@ where T: EzApp
     /// HTTP bind address
     addr: String,
 
-    /// Storage adapter (bridges user storage/state machine to OpenRaft)
-    storage: Arc<StorageAdapter<T>>,
+    /// The log, for the metadata this node keeps outside Raft's own state
+    log: LogStore<T>,
+
+    /// The state machine, for reading the application state directly
+    sm: StateMachineStore<T>,
 
     /// Internal OpenRaft instance
     raft: ORRaft<T>,
@@ -75,7 +84,8 @@ where T: EzApp
         Self {
             node_id: self.node_id,
             addr: self.addr.clone(),
-            storage: self.storage.clone(),
+            log: self.log.clone(),
+            sm: self.sm.clone(),
             raft: self.raft.clone(),
             promotion: self.promotion.clone(),
         }
@@ -188,16 +198,15 @@ where T: EzApp
     ) -> Result<Self, io::Error> {
         let http_addr = http_addr.to_string();
 
-        // Create storage adapter that bridges user traits to OpenRaft
-        let adapter = StorageAdapter::new(storage, app).await?;
-        let adapter = Arc::new(adapter);
+        // Open user storage as the two stores openraft asks for
+        let (log, sm) = open(storage, app).await?;
 
         // Determine node_id, and whether a promotion has to follow. A node that already has an id
         // has joined before, so neither the seed nor the promotion applies to it again: what it
         // is now, the membership decides.
         let mut promote_via = None;
 
-        let node_id = if let Some(id) = adapter.node_id().await {
+        let node_id = if let Some(id) = log.node_id().await {
             // Use persisted node_id (restart case)
             id
         } else if let Some((seed_addr, role)) = &seed {
@@ -213,7 +222,7 @@ where T: EzApp
                 addr: http_addr.clone(),
             };
             admin.membership(enter).await?;
-            adapter.save_meta(|m| m.node_id = Some(id)).await?;
+            log.save_meta(|m| m.node_id = Some(id)).await?;
 
             if *role == NodeRole::Voter {
                 promote_via = Some(admin);
@@ -222,11 +231,11 @@ where T: EzApp
         } else {
             // First node in cluster
             let id = 0;
-            adapter.save_meta(|m| m.node_id = Some(id)).await?;
+            log.save_meta(|m| m.node_id = Some(id)).await?;
             id
         };
 
-        let (log_store, sm_store) = (adapter.clone(), adapter.clone());
+        let (log_store, sm_store) = (log.clone(), sm.clone());
 
         // Convert EzConfig to OpenRaft Config
         let raft_config = config.to_raft_config()?;
@@ -265,7 +274,8 @@ where T: EzApp
         Ok(Self {
             node_id,
             addr: http_addr,
-            storage: adapter,
+            log,
+            sm,
             raft,
             promotion: Arc::new(Mutex::new(promotion)),
         })
@@ -317,7 +327,7 @@ where T: EzApp
     /// ```
     pub async fn read<F, R>(&self, read: F) -> R
     where F: FnOnce(&T) -> R {
-        let sm = self.storage.sm_state.lock().await;
+        let sm = self.sm.sm_state.lock().await;
         read(&sm.app)
     }
 
