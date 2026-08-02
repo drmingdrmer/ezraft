@@ -28,6 +28,22 @@ Breaking, in three ways:
       // now - typed openraft errors, and `retain` is yours to choose
       raft.inner().change_membership(change, false).await?;
 
+- Forwarding to the leader moved out of `EzRaft` and into the server layer.
+  `EzRaft::write` now writes only where it is called and fails on a follower,
+  naming the leader; `POST /api/write` is what takes a write on any node and
+  forwards it. `promote`, `demote` and `remove_node` are leader-only for the
+  same reason, with the admin endpoints answering the leader's address. An
+  `EzRaft` is a node, and a node has no business knowing how to reach another
+  one - that is what the transport around it is for.
+
+  Upgrade tip:
+
+      // in-process, on a node that may not be the leader: no longer forwards
+      raft.write(req).await?;
+
+      // reach the cluster through its front door instead
+      POST http://<any-node>/api/write
+
 - A node created with `EzRaft::join` must now call `EzRaft::serve`. `join`
   starts the promotion to voter and `serve` collects it, because the leader
   grants it only once the node has caught up, which it can only do through the

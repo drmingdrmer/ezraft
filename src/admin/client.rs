@@ -51,29 +51,6 @@ pub(crate) async fn request_change_node_role(seed_addr: String, node_id: u64, ro
     admin_request(&seed_addr, "change_node_role", &req, MEMBERSHIP_CHANGE_TIMEOUT).await
 }
 
-/// Hand a request to the node this one believes to be the leader
-///
-/// How a membership method called on a follower reaches the leader, the way a write forwards. One
-/// attempt, because the caller already asked Raft which node leads: a redirect back means that
-/// answer went stale between the two calls, which is a failure to report rather than a chase to
-/// start - the caller knows how to ask Raft again.
-pub(crate) async fn forward_admin<Req>(leader_addr: &str, endpoint: &str, req: &Req) -> Result<(), io::Error>
-where Req: Serialize {
-    let client = client(MEMBERSHIP_CHANGE_TIMEOUT)?;
-
-    match admin_attempt::<_, ()>(&client, leader_addr, endpoint, req).await? {
-        Ok(()) => Ok(()),
-        Err(Some(leader)) => Err(io::Error::other(format!(
-            "forwarded {} to {}, which no longer leads - {} does",
-            endpoint, leader_addr, leader
-        ))),
-        Err(None) => Err(io::Error::other(format!(
-            "forwarded {} to {}, which no longer leads and knows of no leader",
-            endpoint, leader_addr
-        ))),
-    }
-}
-
 /// Drive one admin endpoint to an answer
 ///
 /// Follows the redirect when the target is not the leader, and retries the transient conditions a

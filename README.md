@@ -106,7 +106,8 @@ read capacity without adding a node that writes must wait for. `EzRaft::promote`
 the leader, makes it a voter whenever you decide to.
 
 **Writes go through the log, reads do not.** `EzRaft::write` returns once the entry is
-committed and applied, and forwards to the leader when called on a follower.
+committed and applied, and only the leader accepts one - `POST /api/write` is what takes a
+write on any node and forwards it.
 `EzRaft::read` runs a closure over local applied state - cheap, and possibly a little
 behind. When a read must see everything acknowledged before it, call
 `EzRaft::linearizable` first.
@@ -259,7 +260,7 @@ yourself for anything past a demo. Its source is the worked example of doing so.
 
 | Method | What it does |
 |--------|--------------|
-| `write(req)` | Runs `req` through the log, returns what `apply` produced. Forwards to the leader from a follower; waits out an election for about ten seconds before failing. |
+| `write(req)` | Runs `req` through the log on this node, returns what `apply` produced. Leader only: on a follower it fails, naming the leader. `POST /api/write` is the forwarding front door. |
 | `read(\|app\| ...)` | Runs a closure over this node's applied state. No consensus round, no log entry. |
 | `linearizable()` | Leader only: confirms leadership with a quorum round-trip and waits for local state to catch up, so a `read` after it sees every acknowledged write. |
 | `metrics()`, `is_leader()`, `node_id()`, `addr()` | Current node and cluster state. |
@@ -269,9 +270,10 @@ yourself for anything past a demo. Its source is the worked example of doing so.
 | `serve()` | Runs the HTTP server, and collects the promotion a `join` started - so a joining node must call it, and a promotion that fails is returned from here. Blocks, so spawn it - `tokio::spawn(raft.clone().serve())` - and start it early: peers reach a node only through this server. |
 | `inner()` | The openraft `Raft` underneath, for anything EzRaft does not wrap. |
 
-Only a leader can change membership, but `promote`, `demote` and `remove_node` are
-callable on any node: a follower forwards to the leader over HTTP and returns its answer,
-the way `write` does. A moment with no leader at all is waited out rather than returned.
+Only a leader accepts a write or a membership change, and none of these methods go looking
+for one: on a follower they fail, naming the leader. Reaching it is the server's job, not a
+node's - `POST /api/write` forwards, and the admin endpoints answer with the leader's
+address. That keeps `EzRaft` a node, with no idea how to talk to another one.
 
 Every fallible method returns `std::io::Error`, including the ones that fail for reasons
 that have nothing to do with I/O: a caller cannot usefully branch on the difference, since

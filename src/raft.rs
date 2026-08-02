@@ -7,23 +7,16 @@ use std::collections::BTreeSet;
 use std::io;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::time::Duration;
 
 use openraft::BasicNode;
 use openraft::ChangeMembers;
 use openraft::Raft;
 use openraft::ReadPolicy;
 use openraft::async_runtime::WatchReceiver;
-use openraft::errors::ClientWriteError;
 use openraft::errors::InitializeError;
 use openraft::errors::RaftError;
-use serde::Serialize;
 use tokio::task::JoinHandle;
-use tokio::time::sleep;
 
-use crate::admin::ChangeNodeRoleRequest;
-use crate::admin::RemoveNodeRequest;
-use crate::admin::client::forward_admin;
 use crate::admin::client::request_add_node;
 use crate::admin::client::request_change_node_role;
 use crate::admin::client::request_node_id;
@@ -272,11 +265,10 @@ where T: EzApp
     /// This proposes a client request to the Raft cluster.
     /// The request will be replicated and applied to the state machine once committed.
     ///
-    /// Only a leader can accept a write. Calling this on a follower forwards the request to the
-    /// leader over HTTP and returns the leader's answer, so a caller never has to track which
-    /// node is currently in charge. Moments without a usable leader - an election in flight, a
-    /// just-elected leader that has not confirmed its lease - are waited out for up to ten
-    /// seconds before the write fails.
+    /// Only a leader can accept a write, and this does not go looking for one: on a follower it
+    /// fails with openraft's `ForwardToLeader`, naming the node to ask. Reaching that node is a
+    /// transport question, so it is answered where the transport lives - `POST /api/write` takes
+    /// a write on any node and forwards it, which is what a client should talk to.
     ///
     /// # Arguments
     ///
@@ -293,37 +285,11 @@ where T: EzApp
     /// let resp = raft.write(req).await?;
     /// ```
     pub async fn write(&self, req: T::Request) -> Result<T::Response, io::Error> {
-        let mut last_err = String::new();
+        let resp = self.raft.client_write(req).await.map_err(|e| io::Error::other(e.to_string()))?;
 
-        for _ in 0..WRITE_ATTEMPTS {
-            let err = match self.raft.client_write(req.clone()).await {
-                // A user write is always answered with `Some` by `apply`; `None` exists only
-                // for framework-generated entries.
-                Ok(resp) => return resp.data.ok_or_else(|| io::Error::other("write produced no response")),
-                Err(e) => e,
-            };
-
-            let RaftError::APIError(ClientWriteError::ForwardToLeader(forward)) = &err else {
-                return Err(io::Error::other(err.to_string()));
-            };
-
-            // Forwarding to ourselves would repeat this call over HTTP forever.
-            match forward.leader_node.as_ref().map(|n| n.addr.as_str()) {
-                Some(leader) if leader != self.addr => return forward_write::<T>(leader, &req).await,
-                // No usable leader: an election is in flight, or a just-elected leader has not
-                // confirmed its quorum lease yet. Both resolve within heartbeats, so wait them
-                // out instead of bothering the caller.
-                _ => {
-                    last_err = err.to_string();
-                    sleep(WRITE_RETRY_INTERVAL).await;
-                }
-            }
-        }
-
-        Err(io::Error::other(format!(
-            "write gave up after {} attempts: {}",
-            WRITE_ATTEMPTS, last_err
-        )))
+        // A user write is always answered with `Some` by `apply`; `None` exists only for
+        // framework-generated entries.
+        resp.data.ok_or_else(|| io::Error::other("write produced no response"))
     }
 
     /// Read the applied state directly, without going through the log
@@ -395,15 +361,9 @@ where T: EzApp
     /// Fails if the node is not a learner of this cluster, and if another membership change is
     /// still in flight, since a cluster admits one at a time. Both are the caller's to retry -
     /// on the joining path that is [`Self::join`]'s promotion request, which retries like every
-    /// other request it makes. Callable on any node: a follower forwards to the leader.
+    /// other request it makes. Leader only: on a follower this fails rather than looking for one.
     pub async fn promote(&self, node_id: u64) -> Result<(), io::Error> {
-        let change = ChangeMembers::AddVoterIds(BTreeSet::from([node_id]));
-        let forward = ChangeNodeRoleRequest {
-            node_id,
-            role: NodeRole::Voter,
-        };
-
-        self.change_members(change, false, "change_node_role", &forward).await
+        self.change_members(ChangeMembers::AddVoterIds(BTreeSet::from([node_id])), false).await
     }
 
     /// Make a voter a learner
@@ -420,17 +380,11 @@ where T: EzApp
     /// Demoting the current leader is allowed. It commits the change and then steps down, and the
     /// remaining voters elect one of their own.
     ///
-    /// Callable on any node: a follower forwards to the leader.
+    /// Leader only: on a follower this fails rather than looking for one.
     pub async fn demote(&self, node_id: u64) -> Result<(), io::Error> {
         // `retain` is what makes this a demotion rather than a removal: the node stays in the
         // membership, as a learner.
-        let change = ChangeMembers::RemoveVoters(BTreeSet::from([node_id]));
-        let forward = ChangeNodeRoleRequest {
-            node_id,
-            role: NodeRole::Learner,
-        };
-
-        self.change_members(change, true, "change_node_role", &forward).await
+        self.change_members(ChangeMembers::RemoveVoters(BTreeSet::from([node_id])), true).await
     }
 
     /// Take a node out of the cluster
@@ -443,11 +397,10 @@ where T: EzApp
     /// what leaves the cluster nothing to talk to; a node removed while still running keeps
     /// serving stale reads to anyone who asks it.
     ///
-    /// Callable on any node: a follower forwards to the leader.
+    /// Leader only: on a follower this fails rather than looking for one.
     pub async fn remove_node(&self, node_id: u64) -> Result<(), io::Error> {
         let metrics = self.metrics().await;
         let node = BTreeSet::from([node_id]);
-        let forward = RemoveNodeRequest { node_id };
 
         // A voter and a learner are removed differently, because a voter is in two places at
         // once. Taking it out of the voter set with `retain` off drops its node entry too, but
@@ -465,54 +418,18 @@ where T: EzApp
             ChangeMembers::RemoveNodes(node)
         };
 
-        self.change_members(change, false, "remove_node", &forward).await
+        self.change_members(change, false).await
     }
 
-    /// Make a membership change, on the leader wherever it is
+    /// Apply a membership change on this node
     ///
-    /// Mirrors [`Self::write`]: attempted here, forwarded over HTTP when this node turns out not
-    /// to be the leader, and waited out while the cluster has none. What crosses the wire is
-    /// `endpoint` and `forward` - the caller's intent, not this node's resolution of it - so the
-    /// leader decides from its own membership rather than from a follower's older copy of it.
-    ///
-    /// Only the leaderless moment is retried. A change the leader refuses - another one already in
-    /// flight, a node that is not a learner - comes straight back to the caller.
-    async fn change_members(
-        &self,
-        change: ChangeMembers<u64, BasicNode>,
-        retain: bool,
-        endpoint: &str,
-        forward: &impl Serialize,
-    ) -> Result<(), io::Error> {
-        let mut last_err = String::new();
-
-        for _ in 0..WRITE_ATTEMPTS {
-            let err = match self.raft.change_membership(change.clone(), retain).await {
-                Ok(_) => return Ok(()),
-                Err(e) => e,
-            };
-
-            let RaftError::APIError(ClientWriteError::ForwardToLeader(to_leader)) = &err else {
-                return Err(io::Error::other(err.to_string()));
-            };
-
-            // Forwarding to ourselves would repeat this call over HTTP forever.
-            match to_leader.leader_node.as_ref().map(|n| n.addr.as_str()) {
-                Some(leader) if leader != self.addr => return forward_admin(leader, endpoint, forward).await,
-                // No usable leader: an election is in flight, or a just-elected leader has not
-                // confirmed its quorum lease yet. Both resolve within heartbeats, so wait them
-                // out instead of bothering the caller.
-                _ => {
-                    last_err = err.to_string();
-                    sleep(WRITE_RETRY_INTERVAL).await;
-                }
-            }
-        }
-
-        Err(io::Error::other(format!(
-            "{} gave up after {} attempts: {}",
-            endpoint, WRITE_ATTEMPTS, last_err
-        )))
+    /// Nothing is retried and nothing is forwarded: on a follower openraft answers
+    /// `ForwardToLeader` and that comes straight back. Reaching the leader belongs to whoever
+    /// speaks the network - the admin endpoints answer with the leader's address, and
+    /// [`crate::admin`] describes that protocol.
+    async fn change_members(&self, change: ChangeMembers<u64, BasicNode>, retain: bool) -> Result<(), io::Error> {
+        self.raft.change_membership(change, retain).await.map_err(|e| io::Error::other(e.to_string()))?;
+        Ok(())
     }
 
     /// Check if this node is the leader
@@ -582,45 +499,4 @@ where T: EzApp
     pub fn inner(&self) -> &ORRaft<T> {
         &self.raft
     }
-}
-
-/// How many times a write retries while the cluster has no usable leader
-const WRITE_ATTEMPTS: usize = 20;
-
-/// How long to wait before retrying a write
-const WRITE_RETRY_INTERVAL: Duration = Duration::from_millis(500);
-
-/// How long a forwarded write may take before the leader is given up on
-///
-/// Generous, because the leader has to replicate and commit the request before answering.
-const FORWARD_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Send a write to the leader's `/api/write` endpoint and return what it applied
-///
-/// The leader is asked to do the write on this node's behalf, so the answer is the same one the
-/// caller would have got from writing to the leader directly.
-async fn forward_write<T>(leader_addr: &str, req: &T::Request) -> Result<T::Response, io::Error>
-where T: EzApp {
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .timeout(FORWARD_WRITE_TIMEOUT)
-        .build()
-        .map_err(|e| io::Error::other(e.to_string()))?;
-
-    let url = format!("http://{}/api/write", leader_addr);
-
-    let resp = client
-        .post(&url)
-        .json(req)
-        .send()
-        .await
-        .map_err(|e| io::Error::other(format!("forwarding write to {} failed: {}", url, e)))?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        return Err(io::Error::other(format!("{} responded {}: {}", url, status, body)));
-    }
-
-    resp.json().await.map_err(|e| io::Error::other(format!("failed to parse write response: {}", e)))
 }

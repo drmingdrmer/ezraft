@@ -5,13 +5,16 @@
 //! - Admin API (joining, node roles, removal, metrics)
 
 use std::io::Cursor;
+use std::time::Duration;
 
 use actix_web::App;
 use actix_web::HttpServer;
 use actix_web::web;
 use actix_web::web::Data;
 use openraft::Snapshot;
+use openraft::errors::ClientWriteError;
 use openraft::errors::Infallible;
+use openraft::errors::RaftError;
 use openraft::errors::decompose::DecomposeResult;
 use openraft::raft;
 use openraft::raft::SnapshotResponse;
@@ -164,17 +167,74 @@ where T: EzApp
     ///
     /// Takes the application's own request type as JSON, runs it through Raft, and returns
     /// whatever the state machine's `apply` produced. This is how a client drives the cluster.
+    ///
+    /// Any node accepts a write: a follower forwards it and answers with what the leader applied,
+    /// so a client never has to track which node is currently in charge. Unlike the admin
+    /// endpoints this forwards rather than redirecting, because `/api/write` is the endpoint a
+    /// plain HTTP client uses, and following a redirect is more than one should have to do.
     async fn handle_write(
         req: web::Json<T::Request>,
         ez: Data<Self>,
     ) -> Result<web::Json<T::Response>, actix_web::Error> {
-        let resp = ez
-            .raft
-            .write(req.into_inner())
-            .await
-            .map_err(|e| actix_web::error::ErrorInternalServerError(format!("write failed: {}", e)))?;
+        let req = req.into_inner();
+        let mut refused = String::new();
 
-        Ok(web::Json(resp))
+        // Submit first and react to the answer, rather than reading the metrics to decide where
+        // to send: leadership can change between any such check and the write that follows it, so
+        // only the write itself is authoritative about who leads now.
+        //
+        // Twice at most, because exactly one answer is worth waiting on - "forward to the leader"
+        // that names no leader, which is an election in flight. The wait below ends the moment one
+        // is elected, so a short election costs only as long as it lasts.
+        for attempt in 0..2 {
+            let err = match ez.raft.inner().client_write(req.clone()).await {
+                // A user write is always answered with `Some` by `apply`; `None` exists only for
+                // framework-generated entries.
+                Ok(resp) => {
+                    let applied = resp
+                        .data
+                        .ok_or_else(|| actix_web::error::ErrorInternalServerError("write produced no response"))?;
+
+                    return Ok(web::Json(applied));
+                }
+                Err(e) => e,
+            };
+
+            let RaftError::APIError(ClientWriteError::ForwardToLeader(to_leader)) = &err else {
+                return Err(actix_web::error::ErrorInternalServerError(format!(
+                    "write failed: {}",
+                    err
+                )));
+            };
+
+            // Forwarding to ourselves would repeat this request over HTTP forever.
+            match to_leader.leader_node.as_ref().map(|n| n.addr.as_str()) {
+                Some(leader) if leader != ez.raft.addr() => {
+                    let applied = forward_write::<T>(leader, &req)
+                        .await
+                        .map_err(|e| actix_web::error::ErrorInternalServerError(format!("write failed: {}", e)))?;
+
+                    return Ok(web::Json(applied));
+                }
+                _ => {
+                    refused = err.to_string();
+
+                    if attempt == 0 {
+                        let _ = ez
+                            .raft
+                            .inner()
+                            .wait(Some(WAIT_FOR_LEADER))
+                            .metrics(|m| m.current_leader.is_some(), "a leader to write to")
+                            .await;
+                    }
+                }
+            }
+        }
+
+        Err(actix_web::error::ErrorInternalServerError(format!(
+            "write failed: {}",
+            refused
+        )))
     }
 
     /// Application read API handler
@@ -321,6 +381,48 @@ where T: EzApp
 pub(crate) async fn run<T>(raft: EzRaft<T>) -> std::io::Result<()>
 where T: EzApp {
     EzServer::new(raft).run().await
+}
+
+/// How long to wait for an election to settle before giving up on writing
+const WAIT_FOR_LEADER: Duration = Duration::from_secs(10);
+
+/// How long a forwarded write may take before the leader is given up on
+///
+/// Generous, because the leader has to replicate and commit the request before answering.
+const FORWARD_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Send a write to the leader's `/api/write` endpoint and return what it applied
+///
+/// The leader does the write on this node's behalf, so the answer is the one the caller would
+/// have got by writing to the leader directly. Reaching a peer is a transport question, so it is
+/// answered here rather than in [`EzRaft`], which is a node and knows nothing about how to talk
+/// to other ones.
+async fn forward_write<T>(leader_addr: &str, req: &T::Request) -> Result<T::Response, std::io::Error>
+where T: EzApp {
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(FORWARD_WRITE_TIMEOUT)
+        .build()
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+
+    let url = format!("http://{}/api/write", leader_addr);
+
+    let resp = client
+        .post(&url)
+        .json(req)
+        .send()
+        .await
+        .map_err(|e| std::io::Error::other(format!("forwarding write to {} failed: {}", url, e)))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(std::io::Error::other(format!("{} responded {}: {}", url, status, body)));
+    }
+
+    resp.json()
+        .await
+        .map_err(|e| std::io::Error::other(format!("failed to parse write response: {}", e)))
 }
 
 /// Query for [`EzServer::handle_read`]

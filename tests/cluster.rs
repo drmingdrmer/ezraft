@@ -155,6 +155,27 @@ fn expected_map(range: std::ops::Range<u32>) -> BTreeMap<String, String> {
     range.map(|i| (format!("k{}", i), format!("v{}", i))).collect()
 }
 
+/// Write through a node's HTTP API, whichever node it is.
+///
+/// `EzRaft::write` only writes where it is called and fails elsewhere with
+/// `ForwardToLeader`; finding the leader belongs to the server layer, and this
+/// is the path that exercises it. So any test that does not know which node
+/// leads - after a failover, a transfer, or a demotion - writes through here.
+async fn http_write(addr: &str, req: Request) -> io::Result<Response> {
+    let resp = reqwest::Client::new()
+        .post(format!("http://{}/api/write", addr))
+        .json(&req)
+        .send()
+        .await
+        .map_err(io::Error::other)?;
+
+    let status = resp.status();
+    let text = resp.text().await.map_err(io::Error::other)?;
+    assert!(status.is_success(), "POST /api/write responded {}: {}", status, text);
+
+    Ok(serde_json::from_str(&text)?)
+}
+
 /// Serve a node in the background, which is also where a join's promotion is
 /// collected - a joined node reaches the voter set only once this is running.
 fn spawn_serve(node: &EzRaft<KvSm>) {
@@ -228,11 +249,8 @@ async fn wait_for_applied(node: &EzRaft<KvSm>, leader: &EzRaft<KvSm>) -> io::Res
     Ok(())
 }
 
-/// Drive an admin endpoint over HTTP, the way an operator would.
-///
-/// A redirect is a test failure: these tests always ask the leader, so being
-/// told to ask someone else means the test set itself up wrong.
-async fn admin_post(addr: &str, endpoint: &str, body: serde_json::Value) -> io::Result<()> {
+/// Drive an admin endpoint over HTTP and return its answer, redirect and all.
+async fn admin_answer(addr: &str, endpoint: &str, body: serde_json::Value) -> io::Result<Redirect> {
     let resp = reqwest::Client::new()
         .post(format!("http://{}/api/{}", addr, endpoint))
         .json(&body)
@@ -250,8 +268,20 @@ async fn admin_post(addr: &str, endpoint: &str, body: serde_json::Value) -> io::
         text
     );
 
-    let answer: Result<(), Option<String>> = serde_json::from_str(&text)?;
-    answer.map_err(|leader| io::Error::other(format!("/api/{} redirected to {:?}", endpoint, leader)))
+    Ok(serde_json::from_str(&text)?)
+}
+
+/// What an admin endpoint answers: done, or the leader to ask instead.
+type Redirect = Result<(), Option<String>>;
+
+/// Drive an admin endpoint over HTTP, the way an operator would.
+///
+/// A redirect is a test failure: these tests always ask the leader, so being
+/// told to ask someone else means the test set itself up wrong.
+async fn admin_post(addr: &str, endpoint: &str, body: serde_json::Value) -> io::Result<()> {
+    admin_answer(addr, endpoint, body)
+        .await?
+        .map_err(|leader| io::Error::other(format!("/api/{} redirected to {:?}", endpoint, leader)))
 }
 
 /// Joining plus serving must be all it takes to become a voter, and those
@@ -319,18 +349,18 @@ async fn join_promotes_to_voter_and_cluster_survives_leader_death() -> io::Resul
 
     // The new leader accepts writes (reached from a follower via forwarding)
     // and still has the data acknowledged before the failover.
-    assert_eq!(Response { value: None }, b.write(set("k2", "v2")).await?);
+    assert_eq!(Response { value: None }, http_write(&addr_b, set("k2", "v2")).await?);
     assert_eq!(
         Response {
             value: Some("v1".into())
         },
-        b.write(get("k1")).await?
+        http_write(&addr_b, get("k1")).await?
     );
     assert_eq!(
         Response {
             value: Some("v2".into())
         },
-        b.write(get("k2")).await?
+        http_write(&addr_b, get("k2")).await?
     );
 
     Ok(())
@@ -545,12 +575,12 @@ async fn lagging_joiner_catches_up_from_snapshot() -> io::Result<()> {
     assert_eq!(expected_map(0..10), b.read(|app| app.data.clone()).await);
 
     // And the pair keeps working past the transfer.
-    assert_eq!(Response { value: None }, b.write(set("k10", "v10")).await?);
+    assert_eq!(Response { value: None }, http_write(&addr_b, set("k10", "v10")).await?);
     assert_eq!(
         Response {
             value: Some("v0".into())
         },
-        b.write(get("k0")).await?
+        http_write(&addr_b, get("k0")).await?
     );
 
     Ok(())
@@ -673,7 +703,7 @@ async fn demote_refuses_to_empty_the_voter_set() -> io::Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn demoted_leader_keeps_leading_outside_the_quorum() -> io::Result<()> {
     let (addr_a, a) = founding_node().await?;
-    let (_, b) = joined_voter(&addr_a).await?;
+    let (addr_b, b) = joined_voter(&addr_a).await?;
     let (_, c) = joined_voter(&addr_a).await?;
 
     let all = BTreeSet::from([0, b.node_id(), c.node_id()]);
@@ -693,7 +723,7 @@ async fn demoted_leader_keeps_leading_outside_the_quorum() -> io::Result<()> {
     // Still leading, and still committing - on a quorum of the two voters,
     // which it is not part of.
     assert!(a.is_leader());
-    assert_eq!(Response { value: None }, a.write(set("k1", "v1")).await?);
+    assert_eq!(Response { value: None }, http_write(&addr_a, set("k1", "v1")).await?);
 
     // And when it does go, the voters elect one of their own.
     a.inner().shutdown().await.map_err(io::Error::other)?;
@@ -705,7 +735,7 @@ async fn demoted_leader_keeps_leading_outside_the_quorum() -> io::Result<()> {
         )
         .await
         .map_err(io::Error::other)?;
-    assert_eq!(Response { value: None }, b.write(set("k2", "v2")).await?);
+    assert_eq!(Response { value: None }, http_write(&addr_b, set("k2", "v2")).await?);
 
     Ok(())
 }
@@ -719,7 +749,7 @@ async fn demoted_leader_keeps_leading_outside_the_quorum() -> io::Result<()> {
 async fn leadership_transfers_to_the_named_node() -> io::Result<()> {
     let (addr_a, a) = founding_node().await?;
     let (_, b) = joined_voter(&addr_a).await?;
-    let (_, c) = joined_voter(&addr_a).await?;
+    let (addr_c, c) = joined_voter(&addr_a).await?;
 
     let all = BTreeSet::from([0, b.node_id(), c.node_id()]);
     wait_for_voters(&a, all, "every joined node is a voter").await?;
@@ -734,7 +764,7 @@ async fn leadership_transfers_to_the_named_node() -> io::Result<()> {
         .await
         .map_err(io::Error::other)?;
 
-    assert_eq!(Response { value: None }, c.write(set("k1", "v1")).await?);
+    assert_eq!(Response { value: None }, http_write(&addr_c, set("k1", "v1")).await?);
 
     Ok(())
 }
@@ -744,7 +774,7 @@ async fn leadership_transfers_to_the_named_node() -> io::Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn removed_leader_hands_over_leadership() -> io::Result<()> {
     let (addr_a, a) = founding_node().await?;
-    let (_, b) = joined_voter(&addr_a).await?;
+    let (addr_b, b) = joined_voter(&addr_a).await?;
     let (_, c) = joined_voter(&addr_a).await?;
 
     let all = BTreeSet::from([0, b.node_id(), c.node_id()]);
@@ -772,7 +802,7 @@ async fn removed_leader_hands_over_leadership() -> io::Result<()> {
         membership.nodes().map(|(id, _)| *id).collect::<Vec<_>>()
     );
 
-    assert_eq!(Response { value: None }, b.write(set("k1", "v1")).await?);
+    assert_eq!(Response { value: None }, http_write(&addr_b, set("k1", "v1")).await?);
 
     Ok(())
 }
@@ -847,48 +877,39 @@ async fn admin_api_changes_roles_and_removes_nodes() -> io::Result<()> {
     Ok(())
 }
 
-/// The membership methods must work when called on a follower, forwarding to
-/// the leader the way `write` does, so a caller never has to find the leader
-/// first. Every change below is asked of `b`, and asserted on `a`.
+/// A membership change asked of a follower must come back with the leader's
+/// address rather than being done or quietly dropped. `EzRaft` does not
+/// forward - it is a node, not a client - so this redirect is the whole
+/// mechanism, and it is what the join path's request loop follows.
 #[tokio::test(flavor = "multi_thread")]
-async fn membership_changes_forward_from_a_follower() -> io::Result<()> {
+async fn admin_api_redirects_a_follower_to_the_leader() -> io::Result<()> {
     let (addr_a, a) = founding_node().await?;
-    let (_, b) = joined_voter(&addr_a).await?;
+    let (addr_b, b) = joined_voter(&addr_a).await?;
     let (_, c) = joined_learner(&addr_a).await?;
     let c_id = c.node_id();
 
     wait_for_voters(&a, BTreeSet::from([0, b.node_id()]), "the joining voter is promoted").await?;
+    assert!(!b.is_leader(), "b has to be a follower for this to be a redirect");
 
-    // Without this the test could pass by asking the leader after all.
-    assert!(!b.is_leader(), "b has to be a follower to be forwarding anything");
+    // Asked of the follower: answered with where to ask instead, and nothing done.
+    let promote = serde_json::json!({"node_id": c_id, "role": "Voter"});
+    assert_eq!(
+        Err(Some(addr_a.clone())),
+        admin_answer(&addr_b, "change_node_role", promote.clone()).await?
+    );
+    assert!(
+        !a.metrics().await.membership_config.membership().voter_ids().any(|id| id == c_id),
+        "the redirected request must not have promoted anything"
+    );
 
-    b.promote(c_id).await?;
+    // The same request to the address it named does it.
+    admin_post(&addr_a, "change_node_role", promote).await?;
     wait_for_voters(
         &a,
         BTreeSet::from([0, b.node_id(), c_id]),
-        "the follower's promote reached the leader",
+        "the leader did what the follower would not",
     )
     .await?;
-
-    b.demote(c_id).await?;
-    wait_for_voters(
-        &a,
-        BTreeSet::from([0, b.node_id()]),
-        "the follower's demote reached the leader",
-    )
-    .await?;
-
-    // `remove_node` picks its change from the caller's own membership, so this
-    // one also covers a follower whose copy may lag the demotion just made.
-    b.remove_node(c_id).await?;
-    a.inner()
-        .wait(WAIT)
-        .metrics(
-            |m| m.membership_config.membership().get_node(&c_id).is_none(),
-            "the follower's remove reached the leader",
-        )
-        .await
-        .map_err(io::Error::other)?;
 
     Ok(())
 }

@@ -17,7 +17,8 @@
 //!
 //! Because every node holds the whole state, any node can answer a read from memory
 //! ([`EzRaft::read`]) without talking to anyone. Writes take the longer path: they go through
-//! one node elected *leader*, and [`EzRaft::write`] finds it for you.
+//! one node elected *leader*. [`EzRaft::write`] writes on the node it is called on, so a client
+//! that does not know which node leads goes through `POST /api/write`, which forwards.
 //!
 //! A *snapshot* is the state serialized. It lets a node that has fallen too far behind be
 //! caught up in one transfer instead of replaying the log, and it lets old log entries be
@@ -112,9 +113,9 @@
 //!
 //! Every fallible method returns [`std::io::Error`], including the ones that fail for reasons
 //! that have nothing to do with I/O. This is deliberate: a caller cannot usefully branch on the
-//! difference. A write that finds no leader, one that cannot reach the leader, and one issued to
-//! a stopped node all mean the same thing to an application -- try again later -- because
-//! [`EzRaft::write`] already forwards to the leader on its own.
+//! difference. A write that finds no leader, one that arrived at a follower, and one issued to
+//! a stopped node all mean the same thing to an application -- try again, or ask the node that
+//! the error names.
 //!
 //! [`EzStorage`] is where a user's own errors originate, and those are I/O errors already, so a
 //! second error type would buy nothing and cost a concept. Code that does need to tell the cases
