@@ -129,9 +129,18 @@ where T: EzApp
     }
 
     /// Update metadata and persist to storage
+    ///
+    /// The log positions are made consistent before anything is written: openraft reads both at
+    /// startup and rejects `last_log_id < last_purged` as a corrupt store. Installing a snapshot
+    /// is what inverts them - the purge that follows moves the purge point past a log that
+    /// stopped short of the snapshot - and keeping the invariant here means no caller has to
+    /// remember it.
     pub async fn save_meta(&self, f: impl FnOnce(&mut EzMeta)) -> Result<(), std::io::Error> {
         let mut state = self.storage.lock().await;
+
         f(&mut state.cached_meta);
+        state.cached_meta.last_log_id = state.cached_meta.last_log_id.max(state.cached_meta.last_purged);
+
         let update = Persist::Meta(state.cached_meta.clone());
         state.storage.persist(update).await
     }
@@ -356,17 +365,9 @@ where T: EzApp
             state.cached_snapshot = Some(new_snapshot(snapshot_meta, &data));
         }
 
-        // The snapshot supersedes every log entry it covers, so the log positions move with it.
-        // Persist them here instead of leaving the cached copy for whoever writes meta next: a
-        // crash in between would leave a snapshot on disk that meta does not account for.
-        //
-        // Never move a position backwards - the local log may already be ahead of the snapshot.
-        let snapshot_log_id = snapshot_meta.last_log_id.map(|id| id.to_type());
-        self.save_meta(|m| {
-            m.last_log_id = m.last_log_id.max(snapshot_log_id);
-            m.last_purged = m.last_purged.max(snapshot_log_id);
-        })
-        .await?;
+        // The log positions are not touched here. openraft purges the log up to the snapshot
+        // right after this, and that purge records both of them: `last_purged` directly, and
+        // `last_log_id` through the invariant [`Self::save_meta`] keeps.
 
         // Update state machine state and restore user state from snapshot
         {
