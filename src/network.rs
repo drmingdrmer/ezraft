@@ -32,6 +32,8 @@ use openraft::network::v2::RaftNetworkV2;
 use openraft::raft::AppendEntriesRequest;
 use openraft::raft::AppendEntriesResponse;
 use openraft::raft::SnapshotResponse;
+use openraft::raft::TransferLeaderRequest;
+use openraft::raft::TransferLeaderResponse;
 use openraft::raft::VoteRequest;
 use openraft::raft::VoteResponse;
 use openraft::type_config::alias::SnapshotOf;
@@ -171,6 +173,21 @@ where T: EzApp
 
     async fn vote(&mut self, req: VoteRequest<C<T>>, option: RPCOption) -> Result<VoteResponse<C<T>>, RPCError<C<T>>> {
         let res = self.request::<_, _, Infallible, C<T>>("raft/vote", req, &option).await?;
+        Ok(res.unwrap())
+    }
+
+    /// Hand leadership to the node openraft picked
+    ///
+    /// This has a default implementation that reports "not implemented", which would leave every
+    /// transfer failing silently - including the one a leader makes on its way out after being
+    /// removed from the voter set, which is how a demoted leader gives the cluster a new one
+    /// promptly instead of leaving it to time out and elect.
+    async fn transfer_leader(
+        &mut self,
+        req: TransferLeaderRequest<C<T>>,
+        option: RPCOption,
+    ) -> Result<TransferLeaderResponse<C<T>>, RPCError<C<T>>> {
+        let res = self.request::<_, _, Infallible, C<T>>("raft/transfer_leader", req, &option).await?;
         Ok(res.unwrap())
     }
 }

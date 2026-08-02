@@ -155,8 +155,107 @@ fn expected_map(range: std::ops::Range<u32>) -> BTreeMap<String, String> {
     range.map(|i| (format!("k{}", i), format!("v{}", i))).collect()
 }
 
-/// Joining must be all it takes to become a voter, and the promoted voters
-/// must keep the cluster alive when the founding leader dies.
+/// Serve a node in the background, which is also where a join's promotion is
+/// collected - a joined node reaches the voter set only once this is running.
+fn spawn_serve(node: &EzRaft<KvSm>) {
+    let node = node.clone();
+    tokio::spawn(async move { node.serve().await });
+}
+
+/// A founding node, serving and leading.
+async fn founding_node() -> io::Result<(String, EzRaft<KvSm>)> {
+    let addr = free_addr();
+    let node = EzRaft::create(&addr, KvSm::default(), MemStorage::default(), config()).await?;
+    spawn_serve(&node);
+    node.inner()
+        .wait(WAIT)
+        .metrics(|m| m.current_leader == Some(0), "founding node leads")
+        .await
+        .map_err(io::Error::other)?;
+    Ok((addr, node))
+}
+
+/// A node that joined asking to be a voter, serving. Returns before the
+/// promotion lands, so callers wait on the voter set.
+async fn joined_voter(seed: &str) -> io::Result<(String, EzRaft<KvSm>)> {
+    let addr = free_addr();
+    let node = EzRaft::join(&addr, seed, KvSm::default(), MemStorage::default(), config()).await?;
+    spawn_serve(&node);
+    Ok((addr, node))
+}
+
+/// A node that joined as a learner, serving.
+async fn joined_learner(seed: &str) -> io::Result<(String, EzRaft<KvSm>)> {
+    let addr = free_addr();
+    let node = EzRaft::join_as_learner(&addr, seed, KvSm::default(), MemStorage::default(), config()).await?;
+    spawn_serve(&node);
+    Ok((addr, node))
+}
+
+/// Wait until `node` has *committed* exactly `voters`, as a uniform config.
+///
+/// Committed, not merely appended: an appended membership is still a change in
+/// flight, and the next one a test asks for is refused while it is. Uniform,
+/// not joint: a joint config still counts the old voter set, so a test that
+/// killed a node on the strength of it would be racing.
+async fn wait_for_voters(node: &EzRaft<KvSm>, voters: BTreeSet<u64>, reason: &str) -> io::Result<()> {
+    node.inner()
+        .wait(WAIT)
+        .metrics(
+            |m| *m.committed_membership_config.membership().get_joint_config() == [voters.clone()],
+            reason,
+        )
+        .await
+        .map_err(io::Error::other)?;
+    Ok(())
+}
+
+/// Wait until `node` has applied everything `leader` had logged when asked.
+///
+/// Anchored to the leader's index, because a node that has replicated nothing
+/// has its own `last_applied` and `last_log_index` both unset, and comparing
+/// those two would pass instantly.
+async fn wait_for_applied(node: &EzRaft<KvSm>, leader: &EzRaft<KvSm>) -> io::Result<()> {
+    let target = leader.metrics().await.last_log_index.expect("the leader has written entries");
+    node.inner()
+        .wait(WAIT)
+        .metrics(
+            |m| m.last_applied.map(|log_id| log_id.index) >= Some(target),
+            "applied the leader's log",
+        )
+        .await
+        .map_err(io::Error::other)?;
+    Ok(())
+}
+
+/// Drive an admin endpoint over HTTP, the way an operator would.
+///
+/// A redirect is a test failure: these tests always ask the leader, so being
+/// told to ask someone else means the test set itself up wrong.
+async fn admin_post(addr: &str, endpoint: &str, body: serde_json::Value) -> io::Result<()> {
+    let resp = reqwest::Client::new()
+        .post(format!("http://{}/api/{}", addr, endpoint))
+        .json(&body)
+        .send()
+        .await
+        .map_err(io::Error::other)?;
+
+    let status = resp.status();
+    let text = resp.text().await.map_err(io::Error::other)?;
+    assert!(
+        status.is_success(),
+        "POST /api/{} responded {}: {}",
+        endpoint,
+        status,
+        text
+    );
+
+    let answer: Result<(), Option<String>> = serde_json::from_str(&text)?;
+    answer.map_err(|leader| io::Error::other(format!("/api/{} redirected to {:?}", endpoint, leader)))
+}
+
+/// Joining plus serving must be all it takes to become a voter, and those
+/// voters must keep the cluster alive when the founding leader dies.
 #[tokio::test(flavor = "multi_thread")]
 async fn join_promotes_to_voter_and_cluster_survives_leader_death() -> io::Result<()> {
     let addr_a = free_addr();
@@ -190,14 +289,7 @@ async fn join_promotes_to_voter_and_cluster_survives_leader_death() -> io::Resul
     // old majority, so killing it mid-change would legitimately lose quorum.
     let voters = BTreeSet::from([0, b.node_id(), c.node_id()]);
     for node in [&a, &b, &c] {
-        node.inner()
-            .wait(WAIT)
-            .metrics(
-                |m| *m.membership_config.membership().get_joint_config() == [voters.clone()],
-                "every joined node promoted to voter",
-            )
-            .await
-            .map_err(io::Error::other)?;
+        wait_for_voters(node, voters.clone(), "every promoted node is a voter").await?;
     }
 
     assert_eq!(Response { value: None }, a.write(set("k1", "v1")).await?);
@@ -244,11 +336,10 @@ async fn join_promotes_to_voter_and_cluster_survives_leader_death() -> io::Resul
     Ok(())
 }
 
-/// A promotion interrupted by the death of the node that admitted the joiner
-/// must be finished by the next leader: promotion belongs to the leader role,
-/// not to the task that handled the join.
+/// A node that joins as a learner must replicate the log and stay a learner
+/// however long it runs, until it is explicitly promoted.
 #[tokio::test(flavor = "multi_thread")]
-async fn next_leader_promotes_orphaned_learner() -> io::Result<()> {
+async fn learner_joins_and_stays_a_learner_until_promoted() -> io::Result<()> {
     let addr_a = free_addr();
     let a = EzRaft::create(&addr_a, KvSm::default(), MemStorage::default(), config()).await?;
     tokio::spawn({
@@ -262,71 +353,60 @@ async fn next_leader_promotes_orphaned_learner() -> io::Result<()> {
         .map_err(io::Error::other)?;
 
     let addr_b = free_addr();
-    let b = EzRaft::join(&addr_b, &addr_a, KvSm::default(), MemStorage::default(), config()).await?;
+    let b = EzRaft::join_as_learner(&addr_b, &addr_a, KvSm::default(), MemStorage::default(), config()).await?;
     tokio::spawn({
         let b = b.clone();
         async move { b.serve().await }
     });
+    let b_id = b.node_id();
 
-    let addr_c = free_addr();
-    let c = EzRaft::join(&addr_c, &addr_a, KvSm::default(), MemStorage::default(), config()).await?;
-    tokio::spawn({
-        let c = c.clone();
-        async move { c.serve().await }
-    });
-
-    let voters = BTreeSet::from([0, b.node_id(), c.node_id()]);
-    for node in [&a, &b, &c] {
-        node.inner()
-            .wait(WAIT)
-            .metrics(
-                |m| *m.membership_config.membership().get_joint_config() == [voters.clone()],
-                "three voters before the fourth joins",
-            )
-            .await
-            .map_err(io::Error::other)?;
+    for i in 1..3 {
+        a.write(set(&format!("k{}", i), &format!("v{}", i))).await?;
     }
 
-    // D joins but its server does not start: it cannot catch up, so it stays a
-    // learner, holding its promotion open past the founding leader's death.
-    let addr_d = free_addr();
-    let d = EzRaft::join(&addr_d, &addr_a, KvSm::default(), MemStorage::default(), config()).await?;
-    let d_id = d.node_id();
-    a.inner()
-        .wait(WAIT)
-        .metrics(
-            |m| m.membership_config.membership().learner_ids().any(|id| id == d_id),
-            "joiner registered as learner",
-        )
-        .await
-        .map_err(io::Error::other)?;
-
-    a.inner().shutdown().await.map_err(io::Error::other)?;
+    // Being caught up is the whole condition a promotion waits for, so once the
+    // learner has applied everything, nothing but an explicit promote is left
+    // to make it a voter. Anchored to the leader's index: a node that has
+    // replicated nothing yet has its own `last_applied` and `last_log_index`
+    // both unset, and comparing those two would pass instantly.
+    let target = a.metrics().await.last_log_index.expect("the leader has written entries");
     b.inner()
         .wait(WAIT)
         .metrics(
-            |m| matches!(m.current_leader, Some(id) if id != 0),
-            "a surviving node takes over",
+            |m| m.last_applied.map(|log_id| log_id.index) >= Some(target),
+            "learner applied the leader's log",
         )
         .await
         .map_err(io::Error::other)?;
 
-    // Only now does D serve and catch up. The node that admitted it is dead,
-    // so only the new leader can complete the promotion.
-    tokio::spawn({
-        let d = d.clone();
-        async move { d.serve().await }
-    });
+    let metrics = a.metrics().await;
+    let membership = metrics.membership_config.membership();
+    assert_eq!(BTreeSet::from([0]), membership.voter_ids().collect::<BTreeSet<_>>());
+    assert_eq!(
+        BTreeSet::from([b_id]),
+        membership.learner_ids().collect::<BTreeSet<_>>()
+    );
 
-    let final_voters = BTreeSet::from([0, b.node_id(), c.node_id(), d_id]);
-    b.inner()
-        .wait(WAIT)
-        .metrics(
-            |m| m.membership_config.membership().voter_ids().collect::<BTreeSet<_>>() == final_voters,
-            "next leader promotes the orphaned learner",
-        )
-        .await
-        .map_err(io::Error::other)?;
+    // A learner is a full replica; it just does not vote.
+    assert_eq!(expected_map(1..3), b.read(|app| app.data.clone()).await);
+
+    // A node the cluster has never heard of cannot be promoted.
+    let unknown = a.promote(b_id + 1000).await.unwrap_err();
+    assert!(
+        unknown.to_string().contains(&format!("Learner {} not found", b_id + 1000)),
+        "unexpected error: {}",
+        unknown
+    );
+
+    a.promote(b_id).await?;
+
+    let voters = BTreeSet::from([0, b_id]);
+    for node in [&a, &b] {
+        wait_for_voters(node, voters.clone(), "the promoted learner is a voter everywhere").await?;
+    }
+
+    // Promoting again is a no-op rather than an error.
+    a.promote(b_id).await?;
 
     Ok(())
 }
@@ -409,8 +489,8 @@ async fn snapshot_survives_restart() -> io::Result<()> {
 }
 
 /// A node that joins after the leader purged its log can only be brought up by
-/// a full snapshot over the network; the join must still end in a voter with
-/// the complete state.
+/// a full snapshot over the network; its promotion waits for that transfer and
+/// must still end in a voter with the complete state.
 #[tokio::test(flavor = "multi_thread")]
 async fn lagging_joiner_catches_up_from_snapshot() -> io::Result<()> {
     let addr_a = free_addr();
@@ -459,14 +539,7 @@ async fn lagging_joiner_catches_up_from_snapshot() -> io::Result<()> {
     });
 
     let voters = BTreeSet::from([0, b.node_id()]);
-    b.inner()
-        .wait(WAIT)
-        .metrics(
-            |m| *m.membership_config.membership().get_joint_config() == [voters.clone()],
-            "snapshot-fed joiner promoted to voter",
-        )
-        .await
-        .map_err(io::Error::other)?;
+    wait_for_voters(&b, voters, "snapshot-fed joiner promoted to voter").await?;
 
     // The whole pre-purge state must have arrived through the snapshot.
     assert_eq!(expected_map(0..10), b.read(|app| app.data.clone()).await);
@@ -532,6 +605,244 @@ async fn automatic_snapshot_purges_old_logs() -> io::Result<()> {
         min_kept,
         purged_index
     );
+
+    Ok(())
+}
+
+/// Demoting a voter must take it out of the quorum without taking it out of
+/// the cluster: it keeps receiving the log, and the voters left still commit.
+#[tokio::test(flavor = "multi_thread")]
+async fn demoted_voter_becomes_a_learner_and_keeps_replicating() -> io::Result<()> {
+    let (addr_a, a) = founding_node().await?;
+    let (_, b) = joined_voter(&addr_a).await?;
+    let (_, c) = joined_voter(&addr_a).await?;
+
+    let all = BTreeSet::from([0, b.node_id(), c.node_id()]);
+    wait_for_voters(&a, all, "every joined node is a voter").await?;
+
+    a.demote(c.node_id()).await?;
+
+    let voters = BTreeSet::from([0, b.node_id()]);
+    wait_for_voters(&a, voters.clone(), "the demoted node left the voter set").await?;
+
+    let metrics = a.metrics().await;
+    let membership = metrics.membership_config.membership();
+    assert_eq!(voters, membership.voter_ids().collect::<BTreeSet<_>>());
+    assert_eq!(
+        BTreeSet::from([c.node_id()]),
+        membership.learner_ids().collect::<BTreeSet<_>>()
+    );
+
+    // This write proves both halves: the two remaining voters are a quorum on
+    // their own, and the demoted node is still sent what they commit.
+    assert_eq!(Response { value: None }, a.write(set("k1", "v1")).await?);
+    wait_for_applied(&c, &a).await?;
+    assert_eq!(expected_map(1..2), c.read(|app| app.data.clone()).await);
+
+    Ok(())
+}
+
+/// Demoting the last voter must be refused: a cluster with no voter can never
+/// commit again, not even the change that would give it one back.
+#[tokio::test(flavor = "multi_thread")]
+async fn demote_refuses_to_empty_the_voter_set() -> io::Result<()> {
+    let (_, a) = founding_node().await?;
+
+    let err = a.demote(0).await.unwrap_err();
+    assert!(
+        err.to_string().contains("new membership cannot be empty"),
+        "unexpected error: {}",
+        err
+    );
+
+    // The refusal must have changed nothing: still one voter, still committing.
+    let metrics = a.metrics().await;
+    assert_eq!(
+        BTreeSet::from([0]),
+        metrics.membership_config.membership().voter_ids().collect::<BTreeSet<_>>()
+    );
+    assert_eq!(Response { value: None }, a.write(set("k1", "v1")).await?);
+
+    Ok(())
+}
+
+/// A leader may demote itself, and openraft leaves it leading: a leader still
+/// in the membership, voter or learner, keeps leading. Pinned here because it
+/// surprises - the node making every decision is no longer counted in any of
+/// them - and because the cluster must still be correct that way.
+#[tokio::test(flavor = "multi_thread")]
+async fn demoted_leader_keeps_leading_outside_the_quorum() -> io::Result<()> {
+    let (addr_a, a) = founding_node().await?;
+    let (_, b) = joined_voter(&addr_a).await?;
+    let (_, c) = joined_voter(&addr_a).await?;
+
+    let all = BTreeSet::from([0, b.node_id(), c.node_id()]);
+    wait_for_voters(&a, all, "every joined node is a voter").await?;
+    assert!(a.is_leader());
+
+    a.demote(0).await?;
+
+    let voters = BTreeSet::from([b.node_id(), c.node_id()]);
+    wait_for_voters(&a, voters.clone(), "the demoted leader left the voter set").await?;
+
+    let metrics = a.metrics().await;
+    let membership = metrics.committed_membership_config.membership();
+    assert_eq!(voters, membership.voter_ids().collect::<BTreeSet<_>>());
+    assert_eq!(BTreeSet::from([0]), membership.learner_ids().collect::<BTreeSet<_>>());
+
+    // Still leading, and still committing - on a quorum of the two voters,
+    // which it is not part of.
+    assert!(a.is_leader());
+    assert_eq!(Response { value: None }, a.write(set("k1", "v1")).await?);
+
+    // And when it does go, the voters elect one of their own.
+    a.inner().shutdown().await.map_err(io::Error::other)?;
+    b.inner()
+        .wait(WAIT)
+        .metrics(
+            |m| matches!(m.current_leader, Some(id) if id != 0),
+            "a voter takes over from the demoted leader",
+        )
+        .await
+        .map_err(io::Error::other)?;
+    assert_eq!(Response { value: None }, b.write(set("k2", "v2")).await?);
+
+    Ok(())
+}
+
+/// Leadership must be transferable to a named node. openraft's default for
+/// the transfer RPC reports "not implemented", so without ezraft implementing
+/// it the transfer is dropped and the leader simply keeps leading - which is
+/// what makes the assertion here specific: leadership moves, and to the node
+/// that was asked for.
+#[tokio::test(flavor = "multi_thread")]
+async fn leadership_transfers_to_the_named_node() -> io::Result<()> {
+    let (addr_a, a) = founding_node().await?;
+    let (_, b) = joined_voter(&addr_a).await?;
+    let (_, c) = joined_voter(&addr_a).await?;
+
+    let all = BTreeSet::from([0, b.node_id(), c.node_id()]);
+    wait_for_voters(&a, all, "every joined node is a voter").await?;
+    assert!(a.is_leader());
+
+    let target = c.node_id();
+    a.inner().trigger().transfer_leader(target).await.map_err(io::Error::other)?;
+
+    c.inner()
+        .wait(WAIT)
+        .metrics(|m| m.current_leader == Some(target), "the named node takes leadership")
+        .await
+        .map_err(io::Error::other)?;
+
+    assert_eq!(Response { value: None }, c.write(set("k1", "v1")).await?);
+
+    Ok(())
+}
+
+/// Removing the leader must hand the cluster on: openraft steps a leader down
+/// once it is out of the membership entirely, and the voters left carry on.
+#[tokio::test(flavor = "multi_thread")]
+async fn removed_leader_hands_over_leadership() -> io::Result<()> {
+    let (addr_a, a) = founding_node().await?;
+    let (_, b) = joined_voter(&addr_a).await?;
+    let (_, c) = joined_voter(&addr_a).await?;
+
+    let all = BTreeSet::from([0, b.node_id(), c.node_id()]);
+    wait_for_voters(&a, all, "every joined node is a voter").await?;
+    assert!(a.is_leader());
+
+    a.remove_node(0).await?;
+
+    b.inner()
+        .wait(WAIT)
+        .metrics(
+            |m| matches!(m.current_leader, Some(id) if id != 0),
+            "leadership moves off the removed node",
+        )
+        .await
+        .map_err(io::Error::other)?;
+
+    let voters = BTreeSet::from([b.node_id(), c.node_id()]);
+    wait_for_voters(&b, voters.clone(), "the removed leader left the cluster").await?;
+
+    let metrics = b.metrics().await;
+    let membership = metrics.committed_membership_config.membership();
+    assert_eq!(
+        voters.iter().copied().collect::<Vec<_>>(),
+        membership.nodes().map(|(id, _)| *id).collect::<Vec<_>>()
+    );
+
+    assert_eq!(Response { value: None }, b.write(set("k1", "v1")).await?);
+
+    Ok(())
+}
+
+/// Removing must work on a learner and on a voter alike, and leave nothing of
+/// either behind in the membership.
+#[tokio::test(flavor = "multi_thread")]
+async fn removed_nodes_leave_the_membership() -> io::Result<()> {
+    let (addr_a, a) = founding_node().await?;
+    let (_, b) = joined_voter(&addr_a).await?;
+    let (_, c) = joined_learner(&addr_a).await?;
+
+    wait_for_voters(&a, BTreeSet::from([0, b.node_id()]), "the joining voter is promoted").await?;
+
+    // A learner has no quorum to leave, only a node entry to drop; a voter has
+    // both, and one change has to do them together.
+    a.remove_node(c.node_id()).await?;
+    a.remove_node(b.node_id()).await?;
+
+    wait_for_voters(&a, BTreeSet::from([0]), "the removed voter left the voter set").await?;
+
+    let metrics = a.metrics().await;
+    let membership = metrics.membership_config.membership();
+    assert_eq!(vec![0], membership.nodes().map(|(id, _)| *id).collect::<Vec<_>>());
+    assert!(membership.learner_ids().next().is_none());
+
+    assert_eq!(Response { value: None }, a.write(set("k1", "v1")).await?);
+
+    Ok(())
+}
+
+/// The admin API must drive the whole lifecycle an operator needs: one
+/// endpoint promotes and demotes, another removes.
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_api_changes_roles_and_removes_nodes() -> io::Result<()> {
+    let (addr_a, a) = founding_node().await?;
+    let (_, b) = joined_learner(&addr_a).await?;
+    let b_id = b.node_id();
+
+    admin_post(
+        &addr_a,
+        "change_node_role",
+        serde_json::json!({"node_id": b_id, "role": "Voter"}),
+    )
+    .await?;
+    wait_for_voters(&a, BTreeSet::from([0, b_id]), "promoted over HTTP").await?;
+
+    admin_post(
+        &addr_a,
+        "change_node_role",
+        serde_json::json!({"node_id": b_id, "role": "Learner"}),
+    )
+    .await?;
+    wait_for_voters(&a, BTreeSet::from([0]), "demoted over HTTP").await?;
+
+    let metrics = a.metrics().await;
+    assert_eq!(
+        BTreeSet::from([b_id]),
+        metrics.membership_config.membership().learner_ids().collect::<BTreeSet<_>>()
+    );
+
+    admin_post(&addr_a, "remove_node", serde_json::json!({"node_id": b_id})).await?;
+    a.inner()
+        .wait(WAIT)
+        .metrics(
+            |m| m.membership_config.membership().get_node(&b_id).is_none(),
+            "removed over HTTP",
+        )
+        .await
+        .map_err(io::Error::other)?;
 
     Ok(())
 }

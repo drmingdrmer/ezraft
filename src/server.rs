@@ -19,8 +19,13 @@ use openraft::raft;
 use openraft::raft::SnapshotResponse;
 use serde::Deserialize;
 
+use crate::admin::AddNodeRequest;
+use crate::admin::ChangeNodeRoleRequest;
+use crate::admin::Redirect;
+use crate::admin::RemoveNodeRequest;
 use crate::app::EzApp;
 use crate::network::SnapshotTransfer;
+use crate::node_role::NodeRole;
 use crate::raft::EzRaft;
 use crate::type_config::OpenRaftTypes;
 
@@ -63,11 +68,15 @@ where T: EzApp
                 .route("/raft/append", web::post().to(Self::handle_append))
                 .route("/raft/vote", web::post().to(Self::handle_vote))
                 .route("/raft/snapshot", web::post().to(Self::handle_snapshot))
+                .route("/raft/transfer_leader", web::post().to(Self::handle_transfer_leader))
                 // Application API
                 .route("/api/write", web::post().to(Self::handle_write))
                 .route("/api/read", web::get().to(Self::handle_read))
                 // Admin API
-                .route("/api/join", web::post().to(Self::handle_join))
+                .route("/api/node_id", web::post().to(Self::handle_node_id))
+                .route("/api/add_node", web::post().to(Self::handle_add_node))
+                .route("/api/change_node_role", web::post().to(Self::handle_change_node_role))
+                .route("/api/remove_node", web::post().to(Self::handle_remove_node))
                 .route("/api/change_membership", web::post().to(Self::handle_change_membership))
                 .route("/api/metrics", web::get().to(Self::handle_metrics))
         })
@@ -109,6 +118,25 @@ where T: EzApp
             .map_err(|e| actix_web::error::ErrorInternalServerError(format!("vote failed: {}", e)))?;
 
         Ok(web::Json(resp))
+    }
+
+    /// Raft transfer leadership RPC handler
+    ///
+    /// A leader hands leadership over rather than stopping and leaving the cluster to notice its
+    /// silence: an election costs a timeout, a transfer costs a round trip. A leader demoted out
+    /// of the voter set does this on its way out.
+    async fn handle_transfer_leader(
+        req: web::Json<raft::TransferLeaderRequest<C<T>>>,
+        ez: Data<Self>,
+    ) -> Result<web::Json<Result<raft::TransferLeaderResponse<C<T>>, Infallible>>, actix_web::Error> {
+        let resp = ez
+            .raft
+            .inner()
+            .handle_transfer_leader(req.into_inner())
+            .await
+            .map_err(|e| actix_web::error::ErrorInternalServerError(format!("transfer_leader failed: {}", e)))?;
+
+        Ok(web::Json(Ok(resp)))
     }
 
     /// Raft install snapshot RPC handler
@@ -192,47 +220,116 @@ where T: EzApp
         Ok(web::Json(metrics))
     }
 
-    /// Join cluster API handler
+    /// Node id API handler
     ///
-    /// A new node calls this endpoint to join an existing cluster.
-    /// The leader assigns a unique node ID based on the log index, adds the node as a learner,
-    /// and promotes it to a voter once it has caught up, so that joining a cluster is all it
-    /// takes to make the cluster fault-tolerant.
-    async fn handle_join(
-        req: web::Json<JoinRequest>,
-        ez: Data<Self>,
-    ) -> Result<web::Json<JoinResponse>, actix_web::Error> {
-        let metrics = ez.raft.metrics().await;
+    /// Hands out an id no other node has held, taken from the index of a blank log entry: the log
+    /// is the one counter every node already agrees on. Ids are therefore unique but not
+    /// consecutive.
+    ///
+    /// This does not add anything to the cluster - [`Self::handle_add_node`] does that - so a
+    /// node that takes an id and dies costs the cluster one unused number.
+    async fn handle_node_id(ez: Data<Self>) -> Result<web::Json<Redirect<u64>>, actix_web::Error> {
+        let leader = match Self::leader_or_redirect(&ez).await {
+            Ok(leader) => leader,
+            Err(redirect) => return Ok(web::Json(Err(redirect))),
+        };
 
-        // Check if we're the leader
-        if metrics.current_leader != Some(metrics.id) {
-            // Not the leader - find leader address and return it
-            let leader_addr = metrics.current_leader.and_then(|leader_id| {
-                metrics.membership_config.membership().get_node(&leader_id).map(|n| n.addr.clone())
-            });
-            return Ok(web::Json(Err(leader_addr)));
-        }
-
-        // We are the leader - write a blank entry to get a unique log index
-        let write_result = ez
-            .raft
+        let write_result = leader
             .inner()
             .write_blank()
             .await
-            .map_err(|e| actix_web::error::ErrorInternalServerError(format!("join write failed: {}", e)))?;
+            .map_err(|e| actix_web::error::ErrorInternalServerError(format!("node id write failed: {}", e)))?;
 
-        let node_id = write_result.log_id.index;
+        Ok(web::Json(Ok(write_result.log_id.index)))
+    }
 
-        // Add the new node as a learner
-        ez.raft
-            .add_learner(node_id, req.addr.clone())
+    /// Add node API handler
+    ///
+    /// Adds a node to the membership as a learner, which replicates the log without voting.
+    /// Making it a voter is [`Self::handle_promote`], and separate for a reason: a node added
+    /// straight to the voter set would be counted in the new configuration's quorum before it
+    /// could answer anything, and the change would wait forever on its own acknowledgement.
+    async fn handle_add_node(
+        req: web::Json<AddNodeRequest>,
+        ez: Data<Self>,
+    ) -> Result<web::Json<Redirect<()>>, actix_web::Error> {
+        let leader = match Self::leader_or_redirect(&ez).await {
+            Ok(leader) => leader,
+            Err(redirect) => return Ok(web::Json(Err(redirect))),
+        };
+
+        leader
+            .add_learner(req.node_id, req.addr.clone())
             .await
-            .map_err(|e| actix_web::error::ErrorInternalServerError(format!("add_learner failed: {}", e)))?;
+            .map_err(|e| actix_web::error::ErrorInternalServerError(format!("add_node failed: {}", e)))?;
 
-        // The reconcile loop promotes the learner once it catches up. The response must go out
-        // first regardless: the new node cannot replicate anything, and therefore cannot catch
-        // up, until it learns its node id.
-        Ok(web::Json(Ok(node_id)))
+        Ok(web::Json(Ok(())))
+    }
+
+    /// Change node role API handler
+    ///
+    /// One endpoint for both directions, because they are one decision: whether this node counts
+    /// towards a quorum.
+    ///
+    /// A promotion holds the answer until it is done, which means until the node has caught up, so
+    /// that request is as long as the catch-up - and the node being promoted must be serving, or
+    /// it can never catch up and this times out. A demotion has nothing to wait for.
+    async fn handle_change_node_role(
+        req: web::Json<ChangeNodeRoleRequest>,
+        ez: Data<Self>,
+    ) -> Result<web::Json<Redirect<()>>, actix_web::Error> {
+        let leader = match Self::leader_or_redirect(&ez).await {
+            Ok(leader) => leader,
+            Err(redirect) => return Ok(web::Json(Err(redirect))),
+        };
+
+        let changed = match req.role {
+            NodeRole::Voter => leader.promote(req.node_id).await,
+            NodeRole::Learner => leader.demote(req.node_id).await,
+        };
+
+        changed.map_err(|e| {
+            actix_web::error::ErrorInternalServerError(format!("change_node_role to {:?} failed: {}", req.role, e))
+        })?;
+
+        Ok(web::Json(Ok(())))
+    }
+
+    /// Remove node API handler
+    ///
+    /// Takes a node out of the cluster, whether it votes or not.
+    async fn handle_remove_node(
+        req: web::Json<RemoveNodeRequest>,
+        ez: Data<Self>,
+    ) -> Result<web::Json<Redirect<()>>, actix_web::Error> {
+        let leader = match Self::leader_or_redirect(&ez).await {
+            Ok(leader) => leader,
+            Err(redirect) => return Ok(web::Json(Err(redirect))),
+        };
+
+        leader
+            .remove_node(req.node_id)
+            .await
+            .map_err(|e| actix_web::error::ErrorInternalServerError(format!("remove_node failed: {}", e)))?;
+
+        Ok(web::Json(Ok(())))
+    }
+
+    /// This node's [`EzRaft`] if it leads, or where to ask instead
+    ///
+    /// Membership is the leader's to change, so every admin handler starts here. The redirect is
+    /// `None` when this node knows of no leader, which is a moment to wait out rather than a
+    /// failure. Both answers come from one reading of the metrics, so they cannot disagree.
+    async fn leader_or_redirect(ez: &Data<Self>) -> Result<&EzRaft<T>, Option<String>> {
+        let metrics = ez.raft.metrics().await;
+
+        if metrics.current_leader == Some(metrics.id) {
+            return Ok(&ez.raft);
+        }
+
+        Err(metrics
+            .current_leader
+            .and_then(|leader_id| metrics.membership_config.membership().get_node(&leader_id).map(|n| n.addr.clone())))
     }
 }
 
@@ -248,13 +345,3 @@ struct ReadQuery {
     /// Key to read, passed to [`EzApp::read`]
     key: String,
 }
-
-/// Join cluster request
-#[derive(Debug, Deserialize)]
-struct JoinRequest {
-    /// New node's HTTP address
-    addr: String,
-}
-
-/// Join cluster response: Ok(node_id) or Err(leader_addr)
-type JoinResponse = Result<u64, Option<String>>;

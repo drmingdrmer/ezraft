@@ -92,10 +92,18 @@ persists it. Ids come from a log index, so they are unique but not consecutive -
 three-node cluster might end up as 0, 7 and 2. On restart the persisted id is reused and
 the seed is not contacted again, so a seed address that has since left is harmless.
 
-**Joining is all it takes to add fault tolerance.** A new node arrives as a *learner* - it
-receives the log but does not count towards a majority - and is promoted to *voter*
-automatically once it has caught up. Three nodes tolerate one failure and five tolerate
-two. An even count buys nothing: four nodes tolerate one failure, the same as three.
+**Joining and serving is all it takes to add fault tolerance.** A new node arrives as a
+*learner* - it receives the log but does not count towards a majority - and `EzRaft::join`
+asks the cluster to promote it to *voter*. That promotion completes only once the node has
+caught up, which it can only do through its own HTTP server, so `EzRaft::serve` is where
+the promotion is awaited and where a failed one is reported. A joining node must call it.
+Three voters tolerate one failure and five tolerate two. An even count buys nothing: four
+tolerate one failure, the same as three.
+
+**A node can stay a learner.** `EzRaft::join_as_learner` joins without asking to be
+promoted: the node replicates the whole log and answers reads, but never votes, so it adds
+read capacity without adding a node that writes must wait for. `EzRaft::promote`, called on
+the leader, makes it a voter whenever you decide to.
 
 **Writes go through the log, reads do not.** `EzRaft::write` returns once the entry is
 committed and applied, and forwards to the leader when called on a follower.
@@ -255,8 +263,11 @@ yourself for anything past a demo. Its source is the worked example of doing so.
 | `read(\|app\| ...)` | Runs a closure over this node's applied state. No consensus round, no log entry. |
 | `linearizable()` | Leader only: confirms leadership with a quorum round-trip and waits for local state to catch up, so a `read` after it sees every acknowledged write. |
 | `metrics()`, `is_leader()`, `node_id()`, `addr()` | Current node and cluster state. |
-| `change_membership(change)` | Membership changes beyond joining, such as removing a node. |
-| `serve()` | Runs the HTTP server. Blocks, so spawn it - `tokio::spawn(raft.clone().serve())` - and start it early: peers reach a node only through this server. |
+| `promote(node_id)` | Leader only: makes that learner a voter. Returns once it is one, so the call lasts as long as bringing it up to date takes. Fails while another membership change is in flight - a cluster admits one at a time - and on an id that is not a learner. |
+| `demote(node_id)` | Leader only: makes that voter a learner. It keeps receiving the log, it stops being counted in the quorum. Refuses to empty the voter set. |
+| `remove_node(node_id)` | Leader only: takes a node out of the cluster, voter or learner. Does not stop the node's own process. |
+| `change_membership(change)` | Membership changes beyond these, expressed as openraft's `ChangeMembers`. |
+| `serve()` | Runs the HTTP server, and collects the promotion a `join` started - so a joining node must call it, and a promotion that fails is returned from here. Blocks, so spawn it - `tokio::spawn(raft.clone().serve())` - and start it early: peers reach a node only through this server. |
 | `inner()` | The openraft `Raft` underneath, for anything EzRaft does not wrap. |
 
 Every fallible method returns `std::io::Error`, including the ones that fail for reasons
@@ -285,7 +296,7 @@ Most users can use `EzConfig::default()`.
 EzRaft includes built-in HTTP endpoints:
 
 - **Raft RPC** (`/raft/*`): Internal consensus communication
-- **Admin API** (`/api/join`, `/api/change_membership`, `/api/metrics`)
+- **Admin API** (`/api/node_id`, `/api/add_node`, `/api/change_node_role`, `/api/remove_node`, `/api/change_membership`, `/api/metrics`): joining is the first three - take an id, enter the membership as a learner, then ask for the voter role. `change_node_role` is one endpoint for both directions, because promoting and demoting are one decision: whether the node counts towards a quorum. Each answers either the result or the address of the leader to ask instead.
 - **Application API** (`POST /api/write`): Propose client requests, using your request type as JSON
 - **Application read** (`GET /api/read?key=...`): A keyed read answered by the app's `read` method from local memory, without a consensus round. An unknown key is a 404.
 

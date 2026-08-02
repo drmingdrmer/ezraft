@@ -121,11 +121,13 @@
 //! apart can reach the underlying openraft node and its typed errors through
 //! [`EzRaft::inner`](raft::EzRaft::inner).
 
+pub mod admin;
 pub mod app;
 pub mod config;
 pub mod entry;
 pub mod meta;
 pub mod network;
+pub mod node_role;
 pub mod raft;
 pub mod server;
 pub mod snapshot;
@@ -138,6 +140,7 @@ pub use config::EzConfig;
 pub use entry::EzEntry;
 pub use entry::EzLogId;
 pub use meta::EzMeta;
+pub use node_role::NodeRole;
 pub use openraft::RaftTypeConfig;
 pub use raft::EzRaft;
 pub use snapshot::EzSnapshot;

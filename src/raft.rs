@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::io;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use openraft::BasicNode;
@@ -13,16 +14,19 @@ use openraft::ChangeMembers;
 use openraft::Raft;
 use openraft::ReadPolicy;
 use openraft::async_runtime::WatchReceiver;
-use openraft::errors::ChangeMembershipError;
 use openraft::errors::ClientWriteError;
 use openraft::errors::InitializeError;
 use openraft::errors::RaftError;
-use serde::Serialize;
+use tokio::task::JoinHandle;
 use tokio::time::sleep;
 
+use crate::admin::client::request_add_node;
+use crate::admin::client::request_change_node_role;
+use crate::admin::client::request_node_id;
 use crate::app::EzApp;
 use crate::config::EzConfig;
 use crate::network::EzNetworkFactory;
+use crate::node_role::NodeRole;
 use crate::storage::EzStorage;
 use crate::storage::adapter::StorageAdapter;
 use crate::type_config::OpenRaftTypes;
@@ -32,6 +36,9 @@ type ORTypes<T> = OpenRaftTypes<T>;
 
 /// The internal OpenRaft instance, with EzRaft's storage adapter as its state machine
 pub type ORRaft<T> = Raft<ORTypes<T>, Arc<StorageAdapter<T>>>;
+
+/// A promotion in flight, handed from [`EzRaft::join`] to [`EzRaft::serve`]
+type Promotion = Arc<Mutex<Option<JoinHandle<Result<(), io::Error>>>>>;
 
 /// EzRaft - A simplified Raft interface
 ///
@@ -56,6 +63,13 @@ where T: EzApp
 
     /// Internal OpenRaft instance
     raft: ORRaft<T>,
+
+    /// The promotion [`Self::join`] started, for [`Self::serve`] to finish
+    ///
+    /// Shared and taken rather than owned, because [`EzRaft`] is cloned freely and only the one
+    /// call to `serve` may await it. `None` once taken, and for a node that never asked to be
+    /// promoted.
+    promotion: Promotion,
 }
 
 impl<T> Clone for EzRaft<T>
@@ -67,6 +81,7 @@ where T: EzApp
             addr: self.addr.clone(),
             storage: self.storage.clone(),
             raft: self.raft.clone(),
+            promotion: self.promotion.clone(),
         }
     }
 }
@@ -100,11 +115,43 @@ where T: EzApp
         Self::new(http_addr, app, storage, config, None).await
     }
 
-    /// Join the cluster that `seed_addr` belongs to
+    /// Join the cluster that `seed_addr` belongs to, and stay a learner
     ///
-    /// The seed assigns this node an id and adds it to the cluster; the seed does not have to be
-    /// the leader. On restart the persisted id is reused and the seed is not contacted again, so
-    /// passing an address that has since left the cluster is harmless.
+    /// Same as [`Self::join`] without the promotion: this node replicates the log and answers
+    /// reads, but never votes, so it is a read replica and costs the cluster no write latency.
+    /// [`Self::promote`], called on the leader, makes it a voter later.
+    pub async fn join_as_learner(
+        http_addr: impl ToString,
+        seed_addr: impl ToString,
+        app: T,
+        storage: impl EzStorage<T>,
+        config: EzConfig,
+    ) -> Result<Self, io::Error> {
+        Self::new(
+            http_addr,
+            app,
+            storage,
+            config,
+            Some((seed_addr.to_string(), NodeRole::Learner)),
+        )
+        .await
+    }
+
+    /// Join the cluster that `seed_addr` belongs to, and become a voter
+    ///
+    /// Three steps, of which this call finishes the first two: the seed hands out a node id, adds
+    /// this node to the cluster as a *learner*, and then the promotion to *voter* is started in
+    /// the background and left for [`Self::serve`] to finish. It has to be left, because a node
+    /// is promoted only once it has caught up, and it cannot receive anything until its own HTTP
+    /// server is running - which is what `serve` starts. So **a joining node must call `serve`**,
+    /// and that is where a failed promotion surfaces.
+    ///
+    /// The seed does not have to be the leader.
+    ///
+    /// On restart the persisted id is reused, the seed is not contacted, and no promotion is
+    /// started: a node that has already joined is whatever the cluster's membership says it is,
+    /// so restarting a node that was deliberately left a learner does not quietly make it a
+    /// voter. Passing an address that has since left the cluster is therefore harmless too.
     ///
     /// # Arguments
     ///
@@ -126,7 +173,14 @@ where T: EzApp
         storage: impl EzStorage<T>,
         config: EzConfig,
     ) -> Result<Self, io::Error> {
-        Self::new(http_addr, app, storage, config, Some(seed_addr.to_string())).await
+        Self::new(
+            http_addr,
+            app,
+            storage,
+            config,
+            Some((seed_addr.to_string(), NodeRole::Voter)),
+        )
+        .await
     }
 
     async fn new(
@@ -134,7 +188,7 @@ where T: EzApp
         app: T,
         storage: impl EzStorage<T>,
         config: EzConfig,
-        seed_addr: Option<String>,
+        seed: Option<(String, NodeRole)>,
     ) -> Result<Self, io::Error> {
         let http_addr = http_addr.to_string();
 
@@ -142,14 +196,26 @@ where T: EzApp
         let adapter = StorageAdapter::new(storage, app).await?;
         let adapter = Arc::new(adapter);
 
-        // Determine node_id
+        // Determine node_id, and whether a promotion has to follow. A node that already has an id
+        // has joined before, so neither the seed nor the promotion applies to it again: what it
+        // is now, the membership decides.
+        let mut promote_via = None;
+
         let node_id = if let Some(id) = adapter.node_id().await {
             // Use persisted node_id (restart case)
             id
-        } else if let Some(seed) = &seed_addr {
-            // Join existing cluster via seed node
-            let id = request_join(seed, &http_addr).await?;
+        } else if let Some((seed_addr, role)) = &seed {
+            // Join existing cluster via seed node: take an id, then enter the membership as a
+            // learner. Always a learner, whichever role was asked for - a node cannot be added
+            // straight to the voter set, because the new configuration's quorum would count a
+            // node that is not answering yet, and the change would wait forever on its own ack.
+            let id = request_node_id(seed_addr).await?;
+            request_add_node(seed_addr, id, &http_addr).await?;
             adapter.save_meta(|m| m.node_id = Some(id)).await?;
+
+            if *role == NodeRole::Voter {
+                promote_via = Some(seed_addr.clone());
+            }
             id
         } else {
             // First node in cluster
@@ -183,55 +249,18 @@ where T: EzApp
             }
         }
 
-        let this = Self {
+        // Asking now, answered later. The leader holds the request until this node has caught up,
+        // which cannot happen until `serve` is running, so the wait belongs there and not here.
+        let promotion =
+            promote_via.map(|seed_addr| tokio::spawn(request_change_node_role(seed_addr, node_id, NodeRole::Voter)));
+
+        Ok(Self {
             node_id,
             addr: http_addr,
             storage: adapter,
             raft,
-        };
-
-        // Promotion belongs to whoever currently leads, so every node runs the loop; it acts
-        // only while this node is the leader.
-        tokio::spawn(this.clone().reconcile_learners());
-
-        Ok(this)
-    }
-
-    /// Promote each caught-up learner while this node leads
-    ///
-    /// EzRaft has no lasting learner state: a learner is a node that has joined and not been
-    /// promoted yet. The join handler only records the learner; promotion happens here, owned
-    /// by the leader role rather than by the node that handled the join, so a promotion
-    /// interrupted by a crash or a leader change is finished by whoever leads next instead of
-    /// dying with the task that started it.
-    async fn reconcile_learners(self) {
-        let promotable = |m: &openraft::RaftMetrics<ORTypes<T>>| -> Option<u64> {
-            let replication = m.replication.as_ref()?;
-            let membership = m.membership_config.membership();
-            membership.learner_ids().find(|id| {
-                let matched = replication.get(id).and_then(|log_id| log_id.as_ref()).map(|log_id| log_id.index);
-                matched >= m.last_log_index
-            })
-        };
-
-        loop {
-            let res =
-                self.raft.wait(None).metrics(|m| promotable(m).is_some(), "a learner is ready for promotion").await;
-
-            let Ok(metrics) = res else {
-                // The node is shutting down.
-                return;
-            };
-
-            let Some(node_id) = promotable(&metrics) else {
-                continue;
-            };
-
-            if let Err(e) = self.promote_to_voter(node_id).await {
-                tracing::error!("failed to promote node {} to voter: {}", node_id, e);
-                sleep(PROMOTE_RETRY_INTERVAL).await;
-            }
-        }
+            promotion: Arc::new(Mutex::new(promotion)),
+        })
     }
 
     /// Write a request to the Raft log
@@ -329,9 +358,10 @@ where T: EzApp
 
     /// Add a learner node to the cluster
     ///
-    /// A learner receives log replication but does not vote. In EzRaft a learner is always a
-    /// transient state - the first half of admitting a node, not a way to build read-only
-    /// replicas: [`Self::reconcile_learners`] promotes every learner once it has caught up.
+    /// A learner receives log replication but does not vote. Every node is admitted this way,
+    /// and stays a learner until [`Self::promote`] makes it a voter: a node cannot be added
+    /// straight to the voter set, because the new configuration's quorum would count a node that
+    /// has not received the response telling it its own id, and so cannot answer anything yet.
     ///
     /// Returns as soon as replication to the new node is set up; the node catches up in the
     /// background. Waiting here would deadlock the join handler, whose caller cannot answer any
@@ -348,67 +378,81 @@ where T: EzApp
         Ok(())
     }
 
-    /// Wait for a learner to catch up, then make it a voter
+    /// Make a learner a voter
     ///
-    /// Only voters count towards a quorum, so a cluster tolerates a node failure only once its
-    /// nodes have been promoted. Promoting a node that is still far behind would stall the
-    /// membership change, hence the wait.
+    /// Only voters count towards a quorum, so a cluster tolerates a node failure only once the
+    /// nodes that joined it have been promoted: three voters tolerate one failure, five tolerate
+    /// two. Joining replicates the log; it does not change who decides. Until this is called the
+    /// new node is a read replica, which is also what to leave it as if that is all you want.
     ///
-    /// A cluster admits one membership change at a time, so when several nodes join at once
-    /// their promotions take turns: one that finds another change in flight waits and retries.
+    /// Returns once the node is a voter. Bringing it up to date is part of the change, so this
+    /// lasts as long as that catch-up takes - for a large state, a whole snapshot transfer.
     ///
-    /// Returns without changing anything if the node is already a voter, or if this node is no
-    /// longer the leader - the new leader's [`Self::reconcile_learners`] owns the promotion
-    /// from that point on.
-    async fn promote_to_voter(&self, node_id: u64) -> Result<(), io::Error> {
-        let caught_up = |m: &openraft::RaftMetrics<ORTypes<T>>| {
-            let Some(replication) = m.replication.as_ref() else {
-                // Not the leader anymore, stop waiting.
-                return true;
-            };
-            let matched = replication.get(&node_id).and_then(|log_id| log_id.as_ref()).map(|log_id| log_id.index);
-            matched >= m.last_log_index
-        };
+    /// Fails if the node is not a learner of this cluster, and if another membership change is
+    /// still in flight, since a cluster admits one at a time. Both are the caller's to retry -
+    /// on the joining path that is [`Self::join`]'s promotion request, which retries like every
+    /// other request it makes. Only a leader can change membership and this does not forward, so
+    /// call it on the leader.
+    pub async fn promote(&self, node_id: u64) -> Result<(), io::Error> {
+        self.change_membership(ChangeMembers::AddVoterIds(BTreeSet::from([node_id]))).await
+    }
 
-        let mut last_err = String::new();
+    /// Make a voter a learner
+    ///
+    /// The node stays in the cluster and keeps receiving the log; it stops being counted in the
+    /// quorum a write must reach. Use it to take a node out of the decision-making without taking
+    /// it out of the cluster - before shutting it down, or to leave it as a read replica.
+    ///
+    /// Demoting the last voter is refused: a cluster with no voter can never commit again, not
+    /// even the change that would give it one back. Demoting below a quorum is *not* refused,
+    /// because it is a legitimate thing to intend, and Raft's answer to it is honest - the
+    /// cluster stops committing until enough voters return.
+    ///
+    /// Demoting the current leader is allowed. It commits the change and then steps down, and the
+    /// remaining voters elect one of their own.
+    ///
+    /// Only a leader can change membership and this does not forward, so call it on the leader.
+    pub async fn demote(&self, node_id: u64) -> Result<(), io::Error> {
+        // `retain` is what makes this a demotion rather than a removal: the node stays in the
+        // membership, as a learner.
+        self.raft
+            .change_membership(ChangeMembers::RemoveVoters(BTreeSet::from([node_id])), true)
+            .await
+            .map_err(|e| io::Error::other(e.to_string()))?;
 
-        for _ in 0..PROMOTE_ATTEMPTS {
-            let metrics = self
-                .raft
-                .wait(None)
-                .metrics(caught_up, "learner catches up before promotion")
+        Ok(())
+    }
+
+    /// Take a node out of the cluster
+    ///
+    /// The cluster stops replicating to it and forgets it. Works on a voter and on a learner
+    /// alike: a voter is removed from the quorum and the membership in one change, so there is no
+    /// window in which a node the caller asked to remove is still being waited for.
+    ///
+    /// This does not stop the node's own process - that is the operator's to do. Doing it first is
+    /// what leaves the cluster nothing to talk to; a node removed while still running keeps
+    /// serving stale reads to anyone who asks it.
+    ///
+    /// Only a leader can change membership and this does not forward, so call it on the leader.
+    pub async fn remove_node(&self, node_id: u64) -> Result<(), io::Error> {
+        let metrics = self.metrics().await;
+        let node = BTreeSet::from([node_id]);
+
+        // A voter and a learner are removed differently, because a voter is in two places at
+        // once. Taking it out of the voter set with `retain` off drops its node entry too, but
+        // only once the joint config that still counts it has resolved - dropping that entry any
+        // sooner would leave the joint config holding a voter with no address to reach it at. A
+        // learner is in no config, so its entry is all there is to drop.
+        if metrics.membership_config.membership().voter_ids().any(|id| id == node_id) {
+            self.raft
+                .change_membership(ChangeMembers::RemoveVoters(node), false)
                 .await
                 .map_err(|e| io::Error::other(e.to_string()))?;
 
-            if metrics.current_leader != Some(self.node_id) {
-                return Ok(());
-            }
-
-            if metrics.membership_config.membership().voter_ids().any(|id| id == node_id) {
-                return Ok(());
-            }
-
-            let change = ChangeMembers::AddVoterIds(BTreeSet::from([node_id]));
-            let err = match self.raft.change_membership(change, false).await {
-                Ok(_) => return Ok(()),
-                Err(e) => e,
-            };
-
-            match &err {
-                RaftError::APIError(ClientWriteError::ChangeMembershipError(ChangeMembershipError::InProgress(_))) => {
-                    last_err = err.to_string();
-                    sleep(PROMOTE_RETRY_INTERVAL).await;
-                }
-                // Deposed between the check above and the change; the new leader owns it now.
-                RaftError::APIError(ClientWriteError::ForwardToLeader(_)) => return Ok(()),
-                _ => return Err(io::Error::other(err.to_string())),
-            }
+            return Ok(());
         }
 
-        Err(io::Error::other(format!(
-            "promotion of node {} gave up after {} attempts: {}",
-            node_id, PROMOTE_ATTEMPTS, last_err
-        )))
+        self.change_membership(ChangeMembers::RemoveNodes(node)).await
     }
 
     /// Change the cluster membership
@@ -447,8 +491,27 @@ where T: EzApp
     /// it: `tokio::spawn(raft.clone().serve())`. Start it as early as possible. Peers reach a
     /// node only through this server, so a node that has joined a cluster but is not serving yet
     /// cannot be replicated to, and holds up every quorum it is counted in.
+    ///
+    /// This is also where the promotion started by [`Self::join`] is collected. The server goes
+    /// up first, because the promotion completes only once this node has caught up and it can
+    /// only catch up through that server; a promotion that fails is returned here, and stops the
+    /// server with it. A node that joined as a learner, or was created, has nothing to collect
+    /// and simply serves.
     pub async fn serve(self) -> Result<(), io::Error> {
-        crate::server::run(self).await
+        let promotion = self.promotion.lock().unwrap().take();
+        let server = tokio::spawn(crate::server::run(self));
+
+        if let Some(promotion) = promotion {
+            let promoted = promotion.await.map_err(io::Error::other)?;
+
+            if let Err(e) = promoted {
+                // Nothing else will stop it: the caller is holding this call, not the server.
+                server.abort();
+                return Err(e);
+            }
+        }
+
+        server.await.map_err(io::Error::other)?
     }
 
     /// Get the node ID
@@ -474,12 +537,6 @@ const WRITE_ATTEMPTS: usize = 20;
 
 /// How long to wait before retrying a write
 const WRITE_RETRY_INTERVAL: Duration = Duration::from_millis(500);
-
-/// How many times a promotion retries while another membership change is in flight
-const PROMOTE_ATTEMPTS: usize = 20;
-
-/// How long to wait before retrying a promotion
-const PROMOTE_RETRY_INTERVAL: Duration = Duration::from_millis(500);
 
 /// How long a forwarded write may take before the leader is given up on
 ///
@@ -514,85 +571,4 @@ where T: EzApp {
     }
 
     resp.json().await.map_err(|e| io::Error::other(format!("failed to parse write response: {}", e)))
-}
-
-/// Request to join a cluster
-#[derive(Debug, Serialize)]
-struct JoinRequest {
-    addr: String,
-}
-
-/// Join response: Ok(node_id) or Err(leader_addr)
-type JoinResponse = Result<u64, Option<String>>;
-
-/// How many times a join is attempted before the node gives up and reports the last failure
-const JOIN_ATTEMPTS: usize = 20;
-
-/// How long to wait before attempting a join again
-const JOIN_RETRY_INTERVAL: Duration = Duration::from_millis(500);
-
-/// How long a single join request may take before the target is given up on
-const JOIN_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Request to join a cluster via seed node
-///
-/// Follows the seed's redirect if it is not the leader, and retries the transient conditions a
-/// starting cluster is full of: no leader elected yet, or another node's membership change still
-/// in flight. A cluster admits one member at a time, so nodes started together take turns here
-/// instead of failing.
-async fn request_join(seed_addr: &str, my_addr: &str) -> Result<u64, io::Error> {
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .timeout(JOIN_TIMEOUT)
-        .build()
-        .map_err(|e| io::Error::other(e.to_string()))?;
-
-    let mut target_addr = seed_addr.to_string();
-    let mut last_err = "cluster did not accept the join".to_string();
-
-    for _ in 0..JOIN_ATTEMPTS {
-        let url = format!("http://{}/api/join", target_addr);
-        let req = JoinRequest {
-            addr: my_addr.to_string(),
-        };
-
-        // A send failure is as transient as the rest: the seed may still be binding its HTTP
-        // socket, since serving starts concurrently with cluster formation.
-        let resp = match client.post(&url).json(&req).send().await {
-            Ok(resp) => resp,
-            Err(e) => {
-                last_err = format!("join request to {} failed: {}", url, e);
-                sleep(JOIN_RETRY_INTERVAL).await;
-                continue;
-            }
-        };
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            last_err = format!("{} responded {}: {}", url, status, body);
-            sleep(JOIN_RETRY_INTERVAL).await;
-            continue;
-        }
-
-        let join_resp: JoinResponse =
-            resp.json().await.map_err(|e| io::Error::other(format!("failed to parse join response: {}", e)))?;
-
-        match join_resp {
-            Ok(node_id) => return Ok(node_id),
-            Err(Some(leader)) => {
-                last_err = format!("{} redirected to {}", url, leader);
-                target_addr = leader;
-            }
-            Err(None) => {
-                last_err = format!("{} knows of no leader", url);
-                sleep(JOIN_RETRY_INTERVAL).await;
-            }
-        }
-    }
-
-    Err(io::Error::other(format!(
-        "join gave up after {} attempts: {}",
-        JOIN_ATTEMPTS, last_err
-    )))
 }
