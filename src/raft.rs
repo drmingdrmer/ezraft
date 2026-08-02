@@ -327,8 +327,7 @@ where T: EzApp
     /// ```
     pub async fn read<F, R>(&self, read: F) -> R
     where F: FnOnce(&T) -> R {
-        let sm = self.sm.sm_state.lock().await;
-        read(&sm.app)
+        self.sm.read(read).await
     }
 
     /// Wait until a local read would be linearizable

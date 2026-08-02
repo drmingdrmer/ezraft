@@ -47,17 +47,17 @@ use crate::type_config::OpenRaftTypes;
 
 /// Internal state machine wrapper that tracks Raft metadata
 /// alongside the user's application
-pub struct StateMachineState<T>
+struct StateMachineState<T>
 where T: EzApp
 {
     /// User's application: the state machine value itself
-    pub app: T,
+    app: T,
 
     /// Last log ID applied to the state machine
-    pub last_applied: Option<LogIdOf<OpenRaftTypes<T>>>,
+    last_applied: Option<LogIdOf<OpenRaftTypes<T>>>,
 
     /// Last membership applied to the state machine
-    pub membership: StoredMembershipOf<OpenRaftTypes<T>>,
+    membership: StoredMembershipOf<OpenRaftTypes<T>>,
 }
 
 /// The user's storage, reached by both stores
@@ -74,23 +74,23 @@ type SharedStorage<T> = Arc<Mutex<Box<dyn EzStorage<T>>>>;
 pub struct LogStore<T>
 where T: EzApp
 {
-    pub(crate) storage: SharedStorage<T>,
+    storage: SharedStorage<T>,
 
     /// Raft metadata: the vote, and the positions bounding the log
-    pub(crate) meta: Arc<Mutex<EzMeta>>,
+    meta: Arc<Mutex<EzMeta>>,
 }
 
 /// The state machine: the user's application, what it has applied, and its snapshot
 pub struct StateMachineStore<T>
 where T: EzApp
 {
-    pub(crate) storage: SharedStorage<T>,
+    storage: SharedStorage<T>,
 
-    pub(crate) sm_state: Arc<Mutex<StateMachineState<T>>>,
+    sm_state: Arc<Mutex<StateMachineState<T>>>,
 
     /// The snapshot last written or loaded, kept so that serving one to a lagging follower does
     /// not re-run the startup-only [`EzStorage::load`].
-    pub(crate) snapshot: Arc<Mutex<Option<EzSnapshot>>>,
+    snapshot: Arc<Mutex<Option<EzSnapshot>>>,
 }
 
 // Hand-written, because deriving would demand `T: Clone` of an application that has no reason
@@ -346,6 +346,17 @@ where T: EzApp
 
         // Load only the requested range from user storage
         storage.read_logs(start, end).await
+    }
+}
+
+impl<T> StateMachineStore<T>
+where T: EzApp
+{
+    /// Run a closure over the applied application state
+    pub async fn read<F, R>(&self, read: F) -> R
+    where F: FnOnce(&T) -> R {
+        let sm = self.sm_state.lock().await;
+        read(&sm.app)
     }
 }
 
