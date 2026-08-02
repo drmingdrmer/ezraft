@@ -249,10 +249,10 @@ async fn wait_for_applied(node: &EzRaft<KvSm>, leader: &EzRaft<KvSm>) -> io::Res
     Ok(())
 }
 
-/// Drive an admin endpoint over HTTP and return its answer, redirect and all.
-async fn admin_answer(addr: &str, endpoint: &str, body: serde_json::Value) -> io::Result<Redirect> {
+/// Ask a node for a membership change and return its answer, redirect and all.
+async fn admin_answer(addr: &str, body: serde_json::Value) -> io::Result<Redirect> {
     let resp = reqwest::Client::new()
-        .post(format!("http://{}/api/{}", addr, endpoint))
+        .post(format!("http://{}/api/membership", addr))
         .json(&body)
         .send()
         .await
@@ -262,8 +262,7 @@ async fn admin_answer(addr: &str, endpoint: &str, body: serde_json::Value) -> io
     let text = resp.text().await.map_err(io::Error::other)?;
     assert!(
         status.is_success(),
-        "POST /api/{} responded {}: {}",
-        endpoint,
+        "POST /api/membership responded {}: {}",
         status,
         text
     );
@@ -274,14 +273,14 @@ async fn admin_answer(addr: &str, endpoint: &str, body: serde_json::Value) -> io
 /// What an admin endpoint answers: done, or the leader to ask instead.
 type Redirect = Result<(), Option<String>>;
 
-/// Drive an admin endpoint over HTTP, the way an operator would.
+/// Drive a membership change over HTTP, the way an operator would.
 ///
 /// A redirect is a test failure: these tests always ask the leader, so being
 /// told to ask someone else means the test set itself up wrong.
-async fn admin_post(addr: &str, endpoint: &str, body: serde_json::Value) -> io::Result<()> {
-    admin_answer(addr, endpoint, body)
+async fn admin_post(addr: &str, body: serde_json::Value) -> io::Result<()> {
+    admin_answer(addr, body)
         .await?
-        .map_err(|leader| io::Error::other(format!("/api/{} redirected to {:?}", endpoint, leader)))
+        .map_err(|leader| io::Error::other(format!("/api/membership redirected to {:?}", leader)))
 }
 
 /// Joining plus serving must be all it takes to become a voter, and those
@@ -844,16 +843,14 @@ async fn admin_api_changes_roles_and_removes_nodes() -> io::Result<()> {
 
     admin_post(
         &addr_a,
-        "change_node_role",
-        serde_json::json!({"node_id": b_id, "role": "Voter"}),
+        serde_json::json!({"op": "SetRole", "node_id": b_id, "role": "Voter"}),
     )
     .await?;
     wait_for_voters(&a, BTreeSet::from([0, b_id]), "promoted over HTTP").await?;
 
     admin_post(
         &addr_a,
-        "change_node_role",
-        serde_json::json!({"node_id": b_id, "role": "Learner"}),
+        serde_json::json!({"op": "SetRole", "node_id": b_id, "role": "Learner"}),
     )
     .await?;
     wait_for_voters(&a, BTreeSet::from([0]), "demoted over HTTP").await?;
@@ -864,7 +861,7 @@ async fn admin_api_changes_roles_and_removes_nodes() -> io::Result<()> {
         metrics.membership_config.membership().learner_ids().collect::<BTreeSet<_>>()
     );
 
-    admin_post(&addr_a, "remove_node", serde_json::json!({"node_id": b_id})).await?;
+    admin_post(&addr_a, serde_json::json!({"op": "Remove", "node_id": b_id})).await?;
     a.inner()
         .wait(WAIT)
         .metrics(
@@ -892,18 +889,15 @@ async fn admin_api_redirects_a_follower_to_the_leader() -> io::Result<()> {
     assert!(!b.is_leader(), "b has to be a follower for this to be a redirect");
 
     // Asked of the follower: answered with where to ask instead, and nothing done.
-    let promote = serde_json::json!({"node_id": c_id, "role": "Voter"});
-    assert_eq!(
-        Err(Some(addr_a.clone())),
-        admin_answer(&addr_b, "change_node_role", promote.clone()).await?
-    );
+    let promote = serde_json::json!({"op": "SetRole", "node_id": c_id, "role": "Voter"});
+    assert_eq!(Err(Some(addr_a.clone())), admin_answer(&addr_b, promote.clone()).await?);
     assert!(
         !a.metrics().await.membership_config.membership().voter_ids().any(|id| id == c_id),
         "the redirected request must not have promoted anything"
     );
 
     // The same request to the address it named does it.
-    admin_post(&addr_a, "change_node_role", promote).await?;
+    admin_post(&addr_a, promote).await?;
     wait_for_voters(
         &a,
         BTreeSet::from([0, b.node_id(), c_id]),

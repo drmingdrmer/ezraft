@@ -301,7 +301,7 @@ Most users can use `EzConfig::default()`.
 EzRaft includes built-in HTTP endpoints:
 
 - **Raft RPC** (`/raft/*`): Internal consensus communication
-- **Admin API** (`/api/node_id`, `/api/add_node`, `/api/change_node_role`, `/api/remove_node`, `/api/metrics`): joining is the first three - take an id, enter the membership as a learner, then ask for the voter role. `change_node_role` is one endpoint for both directions, because promoting and demoting are one decision: whether the node counts towards a quorum. Each answers either the result or the address of the leader to ask instead.
+- **Admin API** (`/api/node_id`, `/api/membership`, `/api/metrics`): `node_id` hands out an id, `membership` adds a node, changes its role or removes it - tagged by `op`, so `{"op": "Add", "node_id": 2, "addr": "..."}`, `{"op": "SetRole", "node_id": 2, "role": "Voter"}` or `{"op": "Remove", "node_id": 2}`. Joining is an id then two membership changes: enter as a learner, then ask for the voter role. One endpoint for all three because they are one decision made in stages - whether a node is a member, and whether it counts towards a quorum. Each answers either the result or the address of the leader to ask instead.
 - **Application API** (`POST /api/write`): Propose client requests, using your request type as JSON
 - **Application read** (`GET /api/read?key=...`): A keyed read answered by the app's `read` method from local memory, without a consensus round. An unknown key is a 404.
 

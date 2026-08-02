@@ -109,7 +109,7 @@ struct Args {
     /// Join as a learner: replicate the log and answer reads, but never vote
     ///
     /// Adds read capacity without adding a node that writes have to wait for. Promote it with
-    /// `POST /api/change_node_role` whenever you decide to.
+    /// `POST /api/membership` whenever you decide to.
     #[arg(long)]
     learner: bool,
 }
@@ -193,8 +193,8 @@ Cluster state - leader, term, log index, membership:
     curl {addr}/api/metrics
 
 Change a node's role - a voter counts towards a quorum, a learner does not:
-    curl -X POST {addr}/api/change_node_role -H 'Content-Type: application/json' \
-        -d '{{"node_id": 1, "role": "Voter"}}'
+    curl -X POST {addr}/api/membership -H 'Content-Type: application/json' \
+        -d '{{"op": "SetRole", "node_id": 1, "role": "Voter"}}'
 "#
     );
 }

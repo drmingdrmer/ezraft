@@ -7,10 +7,8 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::time::sleep;
 
-use crate::admin::add_node::AddNodeRequest;
-use crate::admin::change_node_role::ChangeNodeRoleRequest;
+use crate::admin::membership_change::MembershipChange;
 use crate::admin::redirect::Redirect;
-use crate::node_role::NodeRole;
 
 /// How many times an admin request is attempted before the node gives up
 const ADMIN_ATTEMPTS: usize = 20;
@@ -32,23 +30,21 @@ pub(crate) async fn request_node_id(seed_addr: &str) -> Result<u64, io::Error> {
     admin_request(seed_addr, "node_id", &(), ADMIN_TIMEOUT).await
 }
 
-/// Ask the cluster to add this node to its membership, as a learner
-pub(crate) async fn request_add_node(seed_addr: &str, node_id: u64, my_addr: &str) -> Result<(), io::Error> {
-    let req = AddNodeRequest {
-        node_id,
-        addr: my_addr.to_string(),
-    };
-    admin_request(seed_addr, "add_node", &req, ADMIN_TIMEOUT).await
-}
-
-/// Ask the cluster to make a node a voter or a learner
+/// Ask the cluster to change who is in it
 ///
-/// A promotion is answered only once the node has caught up, so this call is as long as that
-/// catch-up and must be awaited somewhere that is not holding up the node's own HTTP server -
-/// [`EzRaft::serve`](crate::EzRaft::serve) is that place.
-pub(crate) async fn request_change_node_role(seed_addr: String, node_id: u64, role: NodeRole) -> Result<(), io::Error> {
-    let req = ChangeNodeRoleRequest { node_id, role };
-    admin_request(&seed_addr, "change_node_role", &req, MEMBERSHIP_CHANGE_TIMEOUT).await
+/// Takes the address by value so this can be spawned: becoming a voter is answered only once the
+/// node has caught up, so that call is as long as the catch-up and must be awaited somewhere that
+/// is not holding up the node's own HTTP server - [`EzRaft::serve`](crate::EzRaft::serve) is that
+/// place.
+pub(crate) async fn request_membership_change(addr: String, change: MembershipChange) -> Result<(), io::Error> {
+    // A promotion waits for the node to catch up before it is answered; the rest are decided as
+    // soon as the leader commits them.
+    let timeout = match change {
+        MembershipChange::SetRole { .. } => MEMBERSHIP_CHANGE_TIMEOUT,
+        _ => ADMIN_TIMEOUT,
+    };
+
+    admin_request(&addr, "membership", &change, timeout).await
 }
 
 /// Drive one admin endpoint to an answer

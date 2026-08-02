@@ -20,10 +20,8 @@ use openraft::raft;
 use openraft::raft::SnapshotResponse;
 use serde::Deserialize;
 
-use crate::admin::AddNodeRequest;
-use crate::admin::ChangeNodeRoleRequest;
+use crate::admin::MembershipChange;
 use crate::admin::Redirect;
-use crate::admin::RemoveNodeRequest;
 use crate::app::EzApp;
 use crate::network::SnapshotTransfer;
 use crate::node_role::NodeRole;
@@ -75,9 +73,7 @@ where T: EzApp
                 .route("/api/read", web::get().to(Self::handle_read))
                 // Admin API
                 .route("/api/node_id", web::post().to(Self::handle_node_id))
-                .route("/api/add_node", web::post().to(Self::handle_add_node))
-                .route("/api/change_node_role", web::post().to(Self::handle_change_node_role))
-                .route("/api/remove_node", web::post().to(Self::handle_remove_node))
+                .route("/api/membership", web::post().to(Self::handle_membership))
                 .route("/api/metrics", web::get().to(Self::handle_metrics))
         })
         .bind(&addr)?;
@@ -270,7 +266,7 @@ where T: EzApp
     /// is the one counter every node already agrees on. Ids are therefore unique but not
     /// consecutive.
     ///
-    /// This does not add anything to the cluster - [`Self::handle_add_node`] does that - so a
+    /// This does not add anything to the cluster - [`Self::handle_membership`] does that - so a
     /// node that takes an id and dies costs the cluster one unused number.
     async fn handle_node_id(ez: Data<Self>) -> Result<web::Json<Redirect<u64>>, actix_web::Error> {
         let leader = match Self::leader_or_redirect(&ez).await {
@@ -287,14 +283,16 @@ where T: EzApp
         Ok(web::Json(Ok(write_result.log_id.index)))
     }
 
-    /// Add node API handler
+    /// Membership API handler
     ///
-    /// Adds a node to the membership as a learner, which replicates the log without voting.
-    /// Making it a voter is [`Self::handle_change_node_role`], and separate for a reason: a node
-    /// added straight to the voter set would be counted in the new configuration's quorum before
-    /// it could answer anything, and the change would wait forever on its own acknowledgement.
-    async fn handle_add_node(
-        req: web::Json<AddNodeRequest>,
+    /// One endpoint for every change to who is in the cluster, because they are one decision made
+    /// in stages: whether a node is a member at all, and whether it counts towards a quorum.
+    ///
+    /// Adding is separate from making a voter for a reason. A node added straight to the voter set
+    /// would be counted in the new configuration's quorum before it could answer anything, and the
+    /// change would wait forever on its own acknowledgement.
+    async fn handle_membership(
+        req: web::Json<MembershipChange>,
         ez: Data<Self>,
     ) -> Result<web::Json<Redirect<()>>, actix_web::Error> {
         let leader = match Self::leader_or_redirect(&ez).await {
@@ -302,59 +300,18 @@ where T: EzApp
             Err(redirect) => return Ok(web::Json(Err(redirect))),
         };
 
-        leader
-            .add_learner(req.node_id, req.addr.clone())
-            .await
-            .map_err(|e| actix_web::error::ErrorInternalServerError(format!("add_node failed: {}", e)))?;
+        let change = req.into_inner();
 
-        Ok(web::Json(Ok(())))
-    }
-
-    /// Change node role API handler
-    ///
-    /// One endpoint for both directions, because they are one decision: whether this node counts
-    /// towards a quorum.
-    ///
-    /// A promotion holds the answer until it is done, which means until the node has caught up, so
-    /// that request is as long as the catch-up - and the node being promoted must be serving, or
-    /// it can never catch up and this times out. A demotion has nothing to wait for.
-    async fn handle_change_node_role(
-        req: web::Json<ChangeNodeRoleRequest>,
-        ez: Data<Self>,
-    ) -> Result<web::Json<Redirect<()>>, actix_web::Error> {
-        let leader = match Self::leader_or_redirect(&ez).await {
-            Ok(leader) => leader,
-            Err(redirect) => return Ok(web::Json(Err(redirect))),
+        let changed = match &change {
+            MembershipChange::Add { node_id, addr } => leader.add_learner(*node_id, addr.clone()).await,
+            MembershipChange::SetRole { node_id, role } => match role {
+                NodeRole::Voter => leader.promote(*node_id).await,
+                NodeRole::Learner => leader.demote(*node_id).await,
+            },
+            MembershipChange::Remove { node_id } => leader.remove_node(*node_id).await,
         };
 
-        let changed = match req.role {
-            NodeRole::Voter => leader.promote(req.node_id).await,
-            NodeRole::Learner => leader.demote(req.node_id).await,
-        };
-
-        changed.map_err(|e| {
-            actix_web::error::ErrorInternalServerError(format!("change_node_role to {:?} failed: {}", req.role, e))
-        })?;
-
-        Ok(web::Json(Ok(())))
-    }
-
-    /// Remove node API handler
-    ///
-    /// Takes a node out of the cluster, whether it votes or not.
-    async fn handle_remove_node(
-        req: web::Json<RemoveNodeRequest>,
-        ez: Data<Self>,
-    ) -> Result<web::Json<Redirect<()>>, actix_web::Error> {
-        let leader = match Self::leader_or_redirect(&ez).await {
-            Ok(leader) => leader,
-            Err(redirect) => return Ok(web::Json(Err(redirect))),
-        };
-
-        leader
-            .remove_node(req.node_id)
-            .await
-            .map_err(|e| actix_web::error::ErrorInternalServerError(format!("remove_node failed: {}", e)))?;
+        changed.map_err(|e| actix_web::error::ErrorInternalServerError(format!("{:?} failed: {}", change, e)))?;
 
         Ok(web::Json(Ok(())))
     }

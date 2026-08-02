@@ -7,12 +7,21 @@ moved between voter and learner or taken out of the cluster.
 
 Breaking, in three ways:
 
-- `POST /api/join` is gone, replaced by `POST /api/node_id`,
-  `POST /api/add_node`, `POST /api/change_node_role` and
-  `POST /api/remove_node`. Joining is the first three - take an id, enter the
-  membership as a learner, ask for the voter role - and splitting them is what
-  lets a node exist and run before it is a full member. Each answers the result
-  or the address of the leader to ask instead.
+- `POST /api/join` is gone, replaced by `POST /api/node_id` and
+  `POST /api/membership`. Taking an id is split from changing the membership
+  because that is what lets a node exist, and run, before it is a member of
+  anything; the rest is one endpoint because adding a node, changing its role
+  and removing it are one decision made in stages - whether a node is a member,
+  and whether it counts towards a quorum. Both answer the result or the address
+  of the leader to ask instead.
+
+  Example:
+
+      POST /api/node_id     -> 2
+
+      POST /api/membership  {"op": "Add",     "node_id": 2, "addr": "127.0.0.1:8081"}
+      POST /api/membership  {"op": "SetRole", "node_id": 2, "role": "Voter"}
+      POST /api/membership  {"op": "Remove",  "node_id": 2}
 
 - `POST /api/change_membership` and `EzRaft::change_membership` are gone. They
   took openraft's `ChangeMembers` as-is, which put an openraft type in ezraft's
