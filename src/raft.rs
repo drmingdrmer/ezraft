@@ -278,6 +278,13 @@ where T: EzApp
     /// transport question, so it is answered where the transport lives - `POST /api/write` takes
     /// a write on any node and forwards it, which is what a client should talk to.
     ///
+    /// An error does not mean the request was not applied. The entry may be committed and the
+    /// answer lost on the way back, and no caller can tell that apart from a write that never
+    /// happened. Writes are therefore at-least-once: retrying one whose answer never arrived may
+    /// apply it twice. Deduplication has to live in replicated state to survive a leader change,
+    /// which puts it in [`EzApp::apply`] - make it idempotent, or carry a request id in the
+    /// request type and ignore ids the state has already seen.
+    ///
     /// # Arguments
     ///
     /// * `req` - User's request type
