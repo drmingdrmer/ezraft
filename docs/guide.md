@@ -324,6 +324,13 @@ cluster of its own. Wipe data directories only when starting a whole cluster ove
 **Writes fail after ~10 seconds.** No leader: a cluster that has lost its majority cannot
 elect one. Bring enough nodes back.
 
+**A write failed - did it commit?** Possibly. The entry may be replicated and applied with
+only the answer lost on the way back, and nothing at the caller tells that apart from a
+write that never happened. Writes are at-least-once: retrying one whose answer never
+arrived may apply it a second time. Deduplication has to live in replicated state to
+survive a leader change, which puts it in `apply` - make it idempotent, or carry a request
+id in your request type and have `apply` ignore ids the state has already seen.
+
 **Nothing in the logs.** Raft reports through `tracing`, which goes nowhere until a
 subscriber is installed - the example installs one, then `RUST_LOG=info` (or `debug`) shows
 what Raft is doing.
