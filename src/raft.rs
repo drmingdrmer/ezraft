@@ -486,17 +486,34 @@ where T: EzApp
     /// only catch up through that server; a promotion that fails is returned here, and stops the
     /// server with it. A node that joined as a learner, or was created, has nothing to collect
     /// and simply serves.
+    ///
+    /// Whichever of the two fails first is what this returns. A server that cannot bind its
+    /// address says so immediately, instead of waiting out a promotion that was never going to
+    /// arrive without it.
     pub async fn serve(self) -> Result<(), io::Error> {
         let promotion = self.promotion.lock().unwrap().take();
-        let server = tokio::spawn(crate::server::run(self));
+        let mut server = tokio::spawn(crate::server::run(self));
 
-        if let Some(promotion) = promotion {
-            let promoted = promotion.await.map_err(io::Error::other)?;
-
-            if let Err(e) = promoted {
-                // Nothing else will stop it: the caller is holding this call, not the server.
-                server.abort();
-                return Err(e);
+        if let Some(mut promotion) = promotion {
+            // The two are raced rather than collected in turn. A promotion completes only once
+            // this node has caught up, which a server that never came up will never let it do -
+            // waiting for the promotion first would sit on the bind error for the twenty attempts
+            // and ninety seconds each that the promotion still has to spend.
+            tokio::select! {
+                finished = &mut server => {
+                    // The promotion has nothing left to wait for, and would keep asking the
+                    // leader for half an hour if it were merely dropped.
+                    promotion.abort();
+                    return finished.map_err(io::Error::other)?;
+                }
+                promoted = &mut promotion => {
+                    if let Err(e) = promoted.map_err(io::Error::other)? {
+                        // Nothing else will stop it: the caller is holding this call, not the
+                        // server.
+                        server.abort();
+                        return Err(e);
+                    }
+                }
             }
         }
 
