@@ -23,6 +23,7 @@ use serde::Deserialize;
 use crate::admin::MembershipChange;
 use crate::admin::Redirect;
 use crate::app::EzApp;
+use crate::entry::EzRequest;
 use crate::network::SnapshotTransfer;
 use crate::node_role::NodeRole;
 use crate::raft::EzRaft;
@@ -183,7 +184,7 @@ where T: EzApp
         // that names no leader, which is an election in flight. The wait below ends the moment one
         // is elected, so a short election costs only as long as it lasts.
         for attempt in 0..2 {
-            let err = match ez.raft.inner().client_write(req.clone()).await {
+            let err = match ez.raft.inner().client_write(EzRequest(req.clone())).await {
                 // A user write is always answered with `Some` by `apply`; `None` exists only for
                 // framework-generated entries.
                 Ok(resp) => {

@@ -19,8 +19,26 @@ pub type EzLogId = (u64, u64);
 /// Committed leader ID: the term of the leader that proposed a log entry
 pub type EzCommittedLeaderId = CommittedLeaderId<u64>;
 
+/// A request on its way through the log
+///
+/// openraft asks its request type for `Display` as well as `Debug`, to name requests in logs and
+/// errors. This wrapper answers that with `Debug`, which keeps a hand-written `Display` off
+/// [`EzApp::Request`] - a chore with nothing to show for it here, since [`EzEntry`] renders its
+/// payload with `Debug` anyway. Transparent to serde, so it is invisible on the wire and on disk.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(transparent)]
+pub struct EzRequest<D>(pub D);
+
+impl<D> std::fmt::Display for EzRequest<D>
+where D: std::fmt::Debug
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self.0)
+    }
+}
+
 /// Entry payload with EzRaft's node id and node types
-type EzEntryPayload<T> = EntryPayload<<T as EzApp>::Request, u64, BasicNode>;
+type EzEntryPayload<T> = EntryPayload<EzRequest<<T as EzApp>::Request>, u64, BasicNode>;
 
 /// A Raft log entry with EzRaft's simplified log ID type
 ///
@@ -86,7 +104,7 @@ impl<T> RaftEntry for EzEntry<T>
 where T: EzApp
 {
     type CommittedLeaderId = EzCommittedLeaderId;
-    type D = T::Request;
+    type D = EzRequest<T::Request>;
     type NodeId = u64;
     type Node = BasicNode;
 
@@ -134,7 +152,7 @@ mod tests {
     fn ez_entry_clones_without_t_clone() {
         let entry = EzEntry::<Marker> {
             log_id: (7, 9),
-            payload: EntryPayload::Normal("hello".to_string()),
+            payload: EntryPayload::Normal(EzRequest("hello".to_string())),
         };
 
         let clone = entry.clone();
@@ -142,6 +160,24 @@ mod tests {
         let EntryPayload::Normal(req) = clone.payload else {
             panic!("payload variant changed by clone");
         };
-        assert_eq!("hello", req);
+        assert_eq!("hello", req.0);
+    }
+    /// [`EzRequest`] is transparent to serde, so a log written before it still reads back.
+    #[test]
+    fn ez_request_is_invisible_on_the_wire() {
+        let json = r#"{"log_id":[7,9],"payload":{"Normal":"hello"}}"#;
+
+        let entry = EzEntry::<Marker> {
+            log_id: (7, 9),
+            payload: EntryPayload::Normal(EzRequest("hello".to_string())),
+        };
+        assert_eq!(json, serde_json::to_string(&entry).unwrap());
+
+        let back: EzEntry<Marker> = serde_json::from_str(json).unwrap();
+        assert_eq!((7, 9), back.log_id);
+        let EntryPayload::Normal(req) = back.payload else {
+            panic!("payload variant changed by the round trip");
+        };
+        assert_eq!("hello", req.0);
     }
 }

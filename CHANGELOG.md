@@ -7,6 +7,32 @@ moved between voter and learner or taken out of the cluster.
 
 Breaking:
 
+- `EzApp::Request` no longer needs `Display`, only `Debug`. openraft asks its
+  request type for both; `EzRequest`, a transparent newtype, answers the
+  `Display` half with `Debug`, so a hand-written impl is off the list of things
+  a new application has to write. No output is lost - this crate renders an
+  entry's payload with `Debug` either way.
+
+  Breaking only where the request type is named to openraft: an entry's payload
+  is `EntryPayload<EzRequest<T::Request>, ..>`, and `inner().client_write` takes
+  an `EzRequest`. `EzRaft::write`, `EzApp::apply` and the HTTP API are unchanged,
+  and so is the format on the wire and on disk.
+
+  Upgrade tip:
+
+      // was
+      #[derive(Serialize, Deserialize, Debug, Clone, derive_more::Display)]
+      enum Request {
+          #[display("Set({key})")]
+          Set { key: String, value: String },
+      }
+
+      // now
+      #[derive(Serialize, Deserialize, Debug, Clone)]
+      enum Request {
+          Set { key: String, value: String },
+      }
+
 - `POST /api/join` is gone, replaced by `POST /api/node_id` and
   `POST /api/membership`. Taking an id is split from changing the membership
   because that is what lets a node exist, and run, before it is a member of

@@ -1,7 +1,8 @@
 //! The application a cluster replicates
 
+use std::fmt;
+
 use async_trait::async_trait;
-use openraft::AppData;
 use serde::Deserialize;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -25,9 +26,8 @@ use serde::de::DeserializeOwned;
 /// use serde::Deserialize;
 /// use serde::Serialize;
 ///
-/// #[derive(Serialize, Deserialize, Debug, Clone, derive_more::Display)]
+/// #[derive(Serialize, Deserialize, Debug, Clone)]
 /// enum Request {
-///     #[display("Set({key})")]
 ///     Set { key: String, value: String },
 /// }
 ///
@@ -66,10 +66,9 @@ pub trait EzApp: Serialize + DeserializeOwned + Send + Sync + 'static {
     /// Application request type
     ///
     /// Serde carries it over the wire, `Clone` keeps a copy for forwarding to the leader, and
-    /// [`AppData`] asks for `Debug + Display` because openraft prints requests in its logs and
-    /// errors. Derive `Display` (e.g. with `derive_more`) or write a short impl - see
-    /// `examples/kvstore.rs`.
-    type Request: AppData + Serialize + for<'de> Deserialize<'de> + Send + Sync + Clone;
+    /// `Debug` names it in logs and errors. All three derive. openraft wants `Display` here too;
+    /// [`EzRequest`](crate::EzRequest) answers that with `Debug`, so it stays off this trait.
+    type Request: fmt::Debug + Serialize + for<'de> Deserialize<'de> + Send + Sync + Clone + 'static;
 
     /// Application response type
     ///

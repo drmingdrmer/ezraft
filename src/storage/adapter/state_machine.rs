@@ -138,7 +138,7 @@ where T: EzApp
             sm.last_applied = Some(log_id);
 
             let resp = match entry.payload {
-                EntryPayload::Normal(req) => Some(sm.app.apply(req).await),
+                EntryPayload::Normal(req) => Some(sm.app.apply(req.0).await),
                 EntryPayload::Membership(membership) => {
                     sm.membership = StoredMembership::new(Some(log_id), membership);
                     None

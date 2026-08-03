@@ -45,10 +45,9 @@
 //! use serde::Serialize;
 //!
 //! // 1. What a client asks the cluster to do. It travels the network and goes into
-//! //    the log, hence serde; openraft prints it in its logs, hence Display.
-//! #[derive(Serialize, Deserialize, Debug, Clone, derive_more::Display)]
+//! //    the log, hence serde; it is named in logs, hence Debug.
+//! #[derive(Serialize, Deserialize, Debug, Clone)]
 //! enum Request {
-//!     #[display("Set({key})")]
 //!     Set { key: String, value: String },
 //! }
 //!
@@ -140,6 +139,7 @@ pub use app::EzApp;
 pub use config::EzConfig;
 pub use entry::EzEntry;
 pub use entry::EzLogId;
+pub use entry::EzRequest;
 pub use meta::EzMeta;
 pub use node_role::NodeRole;
 pub use openraft::RaftTypeConfig;

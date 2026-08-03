@@ -21,6 +21,7 @@ use crate::admin::AdminClient;
 use crate::admin::MembershipChange;
 use crate::app::EzApp;
 use crate::config::EzConfig;
+use crate::entry::EzRequest;
 use crate::network::EzNetworkFactory;
 use crate::node_role::NodeRole;
 use crate::storage::EzStorage;
@@ -293,7 +294,7 @@ where T: EzApp
     /// let resp = raft.write(req).await?;
     /// ```
     pub async fn write(&self, req: T::Request) -> Result<T::Response, io::Error> {
-        let resp = self.raft.client_write(req).await.map_err(|e| io::Error::other(e.to_string()))?;
+        let resp = self.raft.client_write(EzRequest(req)).await.map_err(|e| io::Error::other(e.to_string()))?;
 
         // A user write is always answered with `Some` by `apply`; `None` exists only for
         // framework-generated entries.
