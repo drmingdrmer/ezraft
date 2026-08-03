@@ -19,8 +19,10 @@ where T: EzApp
 
     /// Write a log entry
     ///
-    /// Entries arrive in index order and never target an index that is already present: the
-    /// framework deletes conflicting entries with [`Persist::DeleteLogs`] first.
+    /// Entries arrive in index order, and writing one replaces whatever is at that index. A crash
+    /// can leave entries the metadata no longer counts - between an entry and the `last_log_id`
+    /// recording it, or between a truncation's metadata and its deletes - and the next append is
+    /// what writes over them.
     #[display("LogEntry")]
     LogEntry(EzEntry<T>),
 

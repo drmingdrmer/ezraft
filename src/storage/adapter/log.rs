@@ -155,30 +155,36 @@ where T: EzApp
     async fn truncate_after(&mut self, last_log_id: Option<LogIdOf<OpenRaftTypes<T>>>) -> Result<(), std::io::Error> {
         let from = last_log_id.map(|id| id.index).next_index();
 
-        // Both held across the delete and the position it moves, so no reader sees the log
+        // Both held across the position and the delete it bounds, so no reader sees the log
         // shrink out from under the last_log_id recorded for it.
         let mut meta = self.meta.lock().await;
         let mut storage = self.storage.lock().await;
 
-        storage.persist(Persist::DeleteLogs { from, to: u64::MAX }).await?;
-
+        // The position first. A crash between the two then leaves entries past the recorded
+        // `last_log_id`, which no read reaches and the next append overwrites; deleting first
+        // would leave metadata promising entries that are already gone.
         meta.last_log_id = last_log_id.map(|id| id.to_type());
-        persist_meta(&mut meta, &mut **storage).await
+        persist_meta(&mut meta, &mut **storage).await?;
+
+        storage.persist(Persist::DeleteLogs { from, to: u64::MAX }).await
     }
 
     async fn purge(&mut self, log_id: LogIdOf<OpenRaftTypes<T>>) -> Result<(), std::io::Error> {
         let mut meta = self.meta.lock().await;
         let mut storage = self.storage.lock().await;
 
+        // The position first, as in `truncate_after`: entries below the recorded `last_purged`
+        // are already unreachable, whereas a purge point lagging the delete points reads at
+        // entries that are gone.
+        meta.last_purged = Some(log_id.to_type());
+        persist_meta(&mut meta, &mut **storage).await?;
+
         storage
             .persist(Persist::DeleteLogs {
                 from: 0,
                 to: log_id.index + 1,
             })
-            .await?;
-
-        meta.last_purged = Some(log_id.to_type());
-        persist_meta(&mut meta, &mut **storage).await
+            .await
     }
 
     async fn get_log_reader(&mut self) -> Self::LogReader {
@@ -231,5 +237,91 @@ where T: EzApp
 
         // Load only the requested range from user storage
         storage.read_logs(start, end).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex as StdMutex;
+
+    use async_trait::async_trait;
+    use openraft::LogId;
+
+    use super::*;
+    use crate::entry::EzEntry;
+    use crate::storage::Loaded;
+    use crate::storage::adapter::open;
+
+    #[derive(serde::Deserialize, serde::Serialize)]
+    struct Marker;
+
+    #[async_trait]
+    impl EzApp for Marker {
+        type Request = String;
+        type Response = String;
+
+        async fn apply(&mut self, req: String) -> String {
+            req
+        }
+
+        fn read(&self, _key: &str) -> Option<serde_json::Value> {
+            None
+        }
+    }
+
+    /// Storage that records what it was asked to write, in the order it was asked
+    #[derive(Clone, Default)]
+    struct Recorder {
+        ops: Arc<StdMutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl EzStorage<Marker> for Recorder {
+        async fn load(&mut self) -> Result<Loaded, std::io::Error> {
+            Ok(Loaded {
+                meta: EzMeta::default(),
+                snapshot: None,
+            })
+        }
+
+        async fn persist(&mut self, op: Persist<Marker>) -> Result<(), std::io::Error> {
+            self.ops.lock().unwrap().push(op.to_string());
+            Ok(())
+        }
+
+        async fn read_logs(&mut self, _start: u64, _end: u64) -> Result<Vec<EzEntry<Marker>>, std::io::Error> {
+            unreachable!("these tests only write")
+        }
+    }
+
+    async fn recording_log_store() -> (LogStore<Marker>, Arc<StdMutex<Vec<String>>>) {
+        let recorder = Recorder::default();
+        let ops = recorder.ops.clone();
+        let (log, _sm) = open(recorder, Marker).await.unwrap();
+        (log, ops)
+    }
+
+    /// A crash after the delete but before the metadata would leave a purge point that reads at
+    /// entries the delete already removed.
+    #[tokio::test]
+    async fn purge_records_the_purge_point_before_deleting() {
+        let (mut log, ops) = recording_log_store().await;
+
+        log.purge(LogId::new_term_index(1, 9)).await.unwrap();
+
+        assert_eq!(["Meta", "DeleteLogs(0..10)"], ops.lock().unwrap()[..]);
+    }
+
+    /// Same the other way round: metadata promising a log that the delete already truncated.
+    #[tokio::test]
+    async fn truncate_records_the_new_end_before_deleting() {
+        let (mut log, ops) = recording_log_store().await;
+
+        log.truncate_after(Some(LogId::new_term_index(1, 4))).await.unwrap();
+
+        assert_eq!(
+            ["Meta".to_string(), format!("DeleteLogs(5..{})", u64::MAX)],
+            ops.lock().unwrap()[..]
+        );
     }
 }
