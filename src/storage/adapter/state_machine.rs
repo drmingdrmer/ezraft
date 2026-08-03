@@ -169,6 +169,12 @@ where T: EzApp
         let mut data = Vec::new();
         cursor.read_to_end(&mut data)?;
 
+        // Deserialized before anything keeps it. Bytes that do not parse - a corrupt transfer, a
+        // peer of an incompatible version - are this transfer's problem, and persisting them would
+        // make them every later start's problem too: [`Self::new`] reads the stored snapshot and
+        // would fail on the same bytes, with the state they replaced already gone.
+        let app = serde_json::from_slice(&data)?;
+
         // Update storage state
         {
             let mut cached = self.snapshot.lock().await;
@@ -186,7 +192,7 @@ where T: EzApp
             let mut sm = self.sm_state.lock().await;
             sm.last_applied = snapshot_meta.last_log_id;
             sm.membership = snapshot_meta.last_membership.clone();
-            sm.app = serde_json::from_slice(&data)?;
+            sm.app = app;
         }
 
         Ok(())
@@ -242,5 +248,111 @@ fn new_snapshot(meta: &EzSnapshotMeta, data: &[u8]) -> EzSnapshot {
     Snapshot {
         meta: meta.clone(),
         snapshot: Cursor::new(data.to_vec()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex as StdMutex;
+
+    use async_trait::async_trait;
+    use openraft::LogId;
+    use openraft::Membership;
+    use serde::Deserialize;
+    use serde::Serialize;
+
+    use super::*;
+    use crate::entry::EzEntry;
+    use crate::meta::EzMeta;
+    use crate::storage::EzStorage;
+    use crate::storage::Loaded;
+    use crate::storage::adapter::open;
+
+    #[derive(Default, Serialize, Deserialize)]
+    struct Counter {
+        count: u64,
+    }
+
+    #[async_trait]
+    impl EzApp for Counter {
+        type Request = u64;
+        type Response = u64;
+
+        async fn apply(&mut self, req: u64) -> u64 {
+            self.count += req;
+            self.count
+        }
+
+        type ReadRequest = ();
+        type ReadResponse = u64;
+
+        fn read(&self, _req: ()) -> u64 {
+            self.count
+        }
+    }
+
+    /// A snapshot as it sits in storage: its metadata, and the bytes of the state
+    type StoredSnapshot = Option<(EzSnapshotMeta, Vec<u8>)>;
+
+    /// Storage that keeps the snapshot it was last asked to persist
+    #[derive(Clone, Default)]
+    struct SnapshotStore {
+        snapshot: Arc<StdMutex<StoredSnapshot>>,
+    }
+
+    #[async_trait]
+    impl EzStorage<Counter> for SnapshotStore {
+        async fn load(&mut self) -> Result<Loaded, std::io::Error> {
+            Ok(Loaded {
+                meta: EzMeta::default(),
+                snapshot: None,
+            })
+        }
+
+        async fn persist(&mut self, op: Persist<Counter>) -> Result<(), std::io::Error> {
+            if let Persist::Snapshot(snapshot) = op {
+                *self.snapshot.lock().unwrap() = Some((snapshot.meta, snapshot.snapshot.into_inner()));
+            }
+            Ok(())
+        }
+
+        async fn read_logs(&mut self, _start: u64, _end: u64) -> Result<Vec<EzEntry<Counter>>, std::io::Error> {
+            unreachable!("these tests only install snapshots")
+        }
+    }
+
+    fn snapshot_meta(index: u64) -> EzSnapshotMeta {
+        let last_log_id = LogId::new_term_index(1, index);
+
+        EzSnapshotMeta {
+            last_log_id: Some(last_log_id),
+            last_membership: StoredMembership::new(Some(last_log_id), Membership::default()),
+            snapshot_id: format!("1-{}", index),
+        }
+    }
+
+    /// A snapshot whose bytes do not deserialize must be refused whole. Keeping it would outlive
+    /// the failed transfer: startup restores from the stored snapshot, so the next start would
+    /// fail on the same bytes - with the state they replaced already gone.
+    #[tokio::test]
+    async fn an_invalid_snapshot_leaves_the_last_valid_one_in_place() {
+        let store = SnapshotStore::default();
+        let persisted = store.snapshot.clone();
+        let (_log, mut sm) = open(store, Counter::default()).await.unwrap();
+
+        let valid = serde_json::to_vec(&Counter { count: 7 }).unwrap();
+        sm.install_snapshot(&snapshot_meta(10), Cursor::new(valid.clone())).await.unwrap();
+
+        let err = sm.install_snapshot(&snapshot_meta(20), Cursor::new(b"not a counter".to_vec())).await.unwrap_err();
+        assert_eq!(std::io::ErrorKind::InvalidData, err.kind(), "unexpected error: {}", err);
+
+        // Nothing of it is kept: not in storage, not in the cache that serves lagging followers,
+        // not in the state machine.
+        assert_eq!(Some((snapshot_meta(10), valid.clone())), *persisted.lock().unwrap());
+
+        let cached = sm.get_current_snapshot().await.unwrap().map(|snap| (snap.meta, snap.snapshot.into_inner()));
+        assert_eq!(Some((snapshot_meta(10), valid)), cached);
+
+        assert_eq!(7, sm.read(|app| app.count).await);
     }
 }
