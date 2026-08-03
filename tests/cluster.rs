@@ -61,8 +61,6 @@ struct KvSm {
 impl EzApp for KvSm {
     type Request = Request;
     type Response = Response;
-    type ReadRequest = String;
-    type ReadResponse = Option<String>;
 
     async fn apply(&mut self, req: Request) -> Response {
         match req {
@@ -75,6 +73,9 @@ impl EzApp for KvSm {
             },
         }
     }
+
+    type ReadRequest = String;
+    type ReadResponse = Option<String>;
 
     fn read(&self, key: String) -> Option<String> {
         self.data.get(&key).cloned()

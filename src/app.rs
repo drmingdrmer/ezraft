@@ -45,8 +45,6 @@ use serde::de::DeserializeOwned;
 /// impl EzApp for KvApp {
 ///     type Request = Request;
 ///     type Response = Response;
-///     type ReadRequest = String;
-///     type ReadResponse = Option<String>;
 ///
 ///     async fn apply(&mut self, req: Request) -> Response {
 ///         match req {
@@ -57,6 +55,9 @@ use serde::de::DeserializeOwned;
 ///             },
 ///         }
 ///     }
+///
+///     type ReadRequest = String;
+///     type ReadResponse = Option<String>;
 ///
 ///     fn read(&self, key: String) -> Option<String> {
 ///         self.data.get(&key).cloned()
@@ -78,6 +79,15 @@ pub trait EzApp: Serialize + DeserializeOwned + Send + Sync + 'static {
     /// forwarded the write, hence the serde bounds.
     type Response: Serialize + for<'de> Deserialize<'de> + Send + Sync + 'static;
 
+    /// Apply a committed request to the state machine
+    ///
+    /// This is where your business logic goes. A request arrives here only once it is
+    /// committed - stored by a majority of the nodes, and past the point of being lost - and
+    /// every node applies the same requests in the same order, which is what keeps their state
+    /// identical. The method is called sequentially, in log order, exactly once per committed
+    /// entry.
+    async fn apply(&mut self, req: Self::Request) -> Self::Response;
+
     /// Read request type
     ///
     /// A read never enters the log, so this type answers to nothing but the app: a key, a range,
@@ -89,15 +99,6 @@ pub trait EzApp: Serialize + DeserializeOwned + Send + Sync + 'static {
     ///
     /// What [`read`](Self::read) produced, serialized back to the caller.
     type ReadResponse: Serialize + Send + 'static;
-
-    /// Apply a committed request to the state machine
-    ///
-    /// This is where your business logic goes. A request arrives here only once it is
-    /// committed - stored by a majority of the nodes, and past the point of being lost - and
-    /// every node applies the same requests in the same order, which is what keeps their state
-    /// identical. The method is called sequentially, in log order, exactly once per committed
-    /// entry.
-    async fn apply(&mut self, req: Self::Request) -> Self::Response;
 
     /// Answer a read against the local state
     ///

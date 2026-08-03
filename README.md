@@ -158,8 +158,6 @@ struct KvApp {
 impl EzApp for KvApp {
     type Request = Request;
     type Response = Response;
-    type ReadRequest = String;
-    type ReadResponse = Option<String>;
 
     /// Called once per committed entry, in log order, on every node.
     async fn apply(&mut self, req: Request) -> Response {
@@ -169,6 +167,9 @@ impl EzApp for KvApp {
             },
         }
     }
+
+    type ReadRequest = String;
+    type ReadResponse = Option<String>;
 
     /// Answers `POST /api/read` from local state. A read never enters the
     /// log, so its request type is the app's own to shape.
@@ -213,10 +214,11 @@ so there is nothing to implement for them.
 pub trait EzApp: Serialize + DeserializeOwned + Send + Sync + 'static {
     type Request: ...;
     type Response: ...;
-    type ReadRequest: ...;
-    type ReadResponse: ...;
 
     async fn apply(&mut self, req: Self::Request) -> Self::Response;
+
+    type ReadRequest: ...;
+    type ReadResponse: ...;
 
     // Powers POST /api/read. An app with nothing to expose answers `()`.
     fn read(&self, req: Self::ReadRequest) -> Self::ReadResponse;

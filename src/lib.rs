@@ -68,8 +68,6 @@
 //! impl EzApp for KvApp {
 //!     type Request = Request;
 //!     type Response = Response;
-//!     type ReadRequest = String;
-//!     type ReadResponse = Option<String>;
 //!
 //!     // Called once per committed entry, in log order, on every node.
 //!     async fn apply(&mut self, req: Request) -> Response {
@@ -79,6 +77,9 @@
 //!             },
 //!         }
 //!     }
+//!
+//!     type ReadRequest = String;
+//!     type ReadResponse = Option<String>;
 //!
 //!     // Answers `POST /api/read` from local state. A read never enters the
 //!     // log, so its request type is the app's own to shape.

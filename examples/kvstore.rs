@@ -83,8 +83,6 @@ struct KvApp {
 impl EzApp for KvApp {
     type Request = Request;
     type Response = Response;
-    type ReadRequest = ReadRequest;
-    type ReadResponse = ReadResponse;
 
     async fn apply(&mut self, req: Request) -> Response {
         match req {
@@ -101,6 +99,9 @@ impl EzApp for KvApp {
             }
         }
     }
+
+    type ReadRequest = ReadRequest;
+    type ReadResponse = ReadResponse;
 
     // Serves `POST /api/read` straight from the map. Both variants are indexed lookups, not
     // scans: `range` starts the walk at the prefix instead of at the first key.

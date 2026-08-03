@@ -259,12 +259,13 @@ mod tests {
     impl EzApp for Marker {
         type Request = String;
         type Response = String;
-        type ReadRequest = ();
-        type ReadResponse = ();
 
         async fn apply(&mut self, req: String) -> String {
             req
         }
+
+        type ReadRequest = ();
+        type ReadResponse = ();
 
         fn read(&self, _req: ()) {}
     }
