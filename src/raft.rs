@@ -150,6 +150,11 @@ where T: EzApp
     /// so restarting a node that was deliberately left a learner does not quietly make it a
     /// voter. Passing an address that has since left the cluster is therefore harmless too.
     ///
+    /// A promotion that failed therefore stays failed, leaving this node the learner it already
+    /// became: entering the membership and being promoted are two steps, and restarting repeats
+    /// neither. Finish it with [`Self::promote`] on the leader, which is the same call an operator
+    /// uses to promote any learner.
+    ///
     /// # Arguments
     ///
     /// * `http_addr` - Address to bind HTTP server (e.g., "127.0.0.1:8081")
@@ -189,6 +194,12 @@ where T: EzApp
     ) -> Result<Self, io::Error> {
         let http_addr = http_addr.to_string();
 
+        // Converted first, because it is the only step that can fail on nothing but its
+        // arguments, and everything below it either takes an id from the cluster or changes the
+        // cluster's membership. A configuration this node cannot run with must not first cost the
+        // cluster a learner that then has to be removed by hand.
+        let raft_config = Arc::new(config.to_raft_config()?);
+
         // Open user storage as the two stores openraft asks for
         let (log, sm) = open(storage, app).await?;
 
@@ -225,10 +236,6 @@ where T: EzApp
             log.save_meta(|m| m.node_id = Some(id)).await?;
             id
         };
-
-        // Convert EzConfig to OpenRaft Config
-        let raft_config = config.to_raft_config()?;
-        let raft_config = Arc::new(raft_config);
 
         // Create network factory
         let network = EzNetworkFactory::new()?;
