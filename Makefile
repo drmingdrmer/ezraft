@@ -30,7 +30,7 @@ unused_dep:
 
 typos:
 	# cargo install typos-cli
-	typos --write-changes src/ examples/ tests/ README.md
+	typos --write-changes src/ examples/ tests/ docs/ README.md
 
 audit:
 	# cargo install cargo-audit
