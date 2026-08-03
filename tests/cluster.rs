@@ -192,9 +192,16 @@ async fn founding_node() -> io::Result<(String, EzRaft<KvSm>)> {
     let addr = free_addr();
     let node = EzRaft::create(&addr, KvSm::default(), MemStorage::default(), config()).await?;
     spawn_serve(&node);
+
+    // Leading is not enough. `create` writes the founding membership and winning the election
+    // does not commit it, so a caller that changes the membership next is refused for having one
+    // already in flight - which is a race it loses only under load.
     node.inner()
         .wait(WAIT)
-        .metrics(|m| m.current_leader == Some(0), "founding node leads")
+        .metrics(
+            |m| m.current_leader == Some(0) && m.committed_membership_config.log_id().is_some(),
+            "founding node leads, with its own membership committed",
+        )
         .await
         .map_err(io::Error::other)?;
     Ok((addr, node))
