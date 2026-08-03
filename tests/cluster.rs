@@ -294,6 +294,37 @@ async fn admin_post(addr: &str, body: serde_json::Value) -> io::Result<()> {
         .map_err(|leader| io::Error::other(format!("/api/membership redirected to {:?}", leader)))
 }
 
+/// `serve` must report a server that cannot start, even for a joining voter whose promotion is
+/// still pending. The promotion is waiting for this node to catch up, which it can only do
+/// through the server that just failed, so collecting the promotion first would sit on the bind
+/// error for the twenty attempts and ninety seconds each it still has to spend.
+#[tokio::test(flavor = "multi_thread")]
+async fn serve_reports_a_server_that_cannot_bind_instead_of_awaiting_promotion() -> io::Result<()> {
+    let (seed, _seed_node) = founding_node().await?;
+
+    // Hold the address the node is about to claim, so its server cannot bind it.
+    let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = occupied.local_addr().unwrap().to_string();
+
+    let node = EzRaft::join(&addr, &seed, KvSm::default(), MemStorage::default(), config()).await?;
+
+    // Comfortably below the promotion's own retry budget, and far above what returning a bind
+    // error takes.
+    let served = tokio::time::timeout(Duration::from_secs(5), node.serve())
+        .await
+        .map_err(|_| io::Error::other("serve is still waiting for a promotion its server cannot deliver"))?;
+
+    let err = served.expect_err("serve reports the bind failure");
+    assert_eq!(
+        io::ErrorKind::AddrInUse,
+        err.kind(),
+        "the error is the bind failure itself: {}",
+        err
+    );
+
+    Ok(())
+}
+
 /// Joining plus serving must be all it takes to become a voter, and those
 /// voters must keep the cluster alive when the founding leader dies.
 #[tokio::test(flavor = "multi_thread")]
