@@ -189,7 +189,7 @@ async fn main() -> io::Result<()> {
         value: "world".to_string(),
     })
     .await?;
-    println!("{:?}", raft.read(|app| app.data.get("hello").cloned()).await);
+    println!("{:?}", raft.read(|app| app.data.get("hello").cloned()).await?);
 
     // Serves the Raft RPCs peers need, plus the app API. This blocks;
     // `tokio::spawn` it when the caller has other work to do.

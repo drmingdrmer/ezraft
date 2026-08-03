@@ -5,7 +5,7 @@
 Learner support. A node can join and stay a learner, and any member can be
 moved between voter and learner or taken out of the cluster.
 
-Breaking, in four ways:
+Breaking:
 
 - `POST /api/join` is gone, replaced by `POST /api/node_id` and
   `POST /api/membership`. Taking an id is split from changing the membership
@@ -59,6 +59,22 @@ Breaking, in four ways:
   being passed twice. `ORRaft`, which `EzRaft::inner` returns, is now
   `Raft<OpenRaftTypes<T>, StateMachineStore<T>>`. Code that only calls methods
   on `EzRaft::inner()` is unaffected; code that names the type is not.
+
+- `EzRaft::read` returns `Result` and takes a `'static` closure. It reaches the
+  state machine through openraft's `Raft::with_state_machine` now, rather than
+  through a private handle held beside it, so the closure runs on the state
+  machine's own task and must own what it captures. The error is a shut-down
+  node, and nothing else.
+
+  Upgrade tip:
+
+      // was
+      let key = &query.key;
+      let value = raft.read(|app| app.read(key)).await;
+
+      // now - capture by value, and handle a shut-down node
+      let key = query.key.clone();
+      let value = raft.read(move |app| app.read(&key)).await?;
 
 - A node created with `EzRaft::join` must now call `EzRaft::serve`. `join`
   starts the promotion to voter and `serve` collects it, because the leader

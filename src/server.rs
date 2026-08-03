@@ -245,10 +245,18 @@ where T: EzApp
         query: web::Query<ReadQuery>,
         ez: Data<Self>,
     ) -> Result<web::Json<serde_json::Value>, actix_web::Error> {
-        let key = &query.key;
+        // Cloned because the read runs on the state machine's own task, which as far as the
+        // compiler is concerned outlives this request.
+        let key = query.key.clone();
 
-        let Some(value) = ez.raft.read(|app| app.read(key)).await else {
-            return Err(actix_web::error::ErrorNotFound(format!("no value for key {:?}", key)));
+        let found =
+            ez.raft.read(move |app| app.read(&key)).await.map_err(actix_web::error::ErrorInternalServerError)?;
+
+        let Some(value) = found else {
+            return Err(actix_web::error::ErrorNotFound(format!(
+                "no value for key {:?}",
+                query.key
+            )));
         };
 
         Ok(web::Json(value))

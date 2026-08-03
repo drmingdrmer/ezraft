@@ -63,9 +63,6 @@ where T: EzApp
     /// The log, for the metadata this node keeps outside Raft's own state
     log: LogStore<T>,
 
-    /// The state machine, for reading the application state directly
-    sm: StateMachineStore<T>,
-
     /// Internal OpenRaft instance
     raft: ORRaft<T>,
 
@@ -85,7 +82,6 @@ where T: EzApp
             node_id: self.node_id,
             addr: self.addr.clone(),
             log: self.log.clone(),
-            sm: self.sm.clone(),
             raft: self.raft.clone(),
             promotion: self.promotion.clone(),
         }
@@ -235,7 +231,7 @@ where T: EzApp
             id
         };
 
-        let (log_store, sm_store) = (log.clone(), sm.clone());
+        let log_store = log.clone();
 
         // Convert EzConfig to OpenRaft Config
         let raft_config = config.to_raft_config()?;
@@ -245,7 +241,7 @@ where T: EzApp
         let network = EzNetworkFactory::new()?;
 
         // Create OpenRaft instance
-        let raft = Raft::new(node_id, raft_config, network, log_store, sm_store)
+        let raft = Raft::new(node_id, raft_config, network, log_store, sm)
             .await
             .map_err(|e| io::Error::other(e.to_string()))?;
 
@@ -275,7 +271,6 @@ where T: EzApp
             node_id,
             addr: http_addr,
             log,
-            sm,
             raft,
             promotion: Arc::new(Mutex::new(promotion)),
         })
@@ -320,14 +315,20 @@ where T: EzApp
     /// linearizable on its own: this node, leader included, may not have applied the latest
     /// acknowledged write yet. Call [`Self::linearizable`] first when read-your-writes matters.
     ///
+    /// The closure runs on the state machine's own task, so it must be `'static`: capture what it
+    /// needs by value. It errors only if this node has shut down.
+    ///
     /// # Example
     ///
     /// ```ignore
-    /// let value = raft.read(|app| app.data.get("foo").cloned()).await;
+    /// let value = raft.read(|app| app.data.get("foo").cloned()).await?;
     /// ```
-    pub async fn read<F, R>(&self, read: F) -> R
-    where F: FnOnce(&T) -> R {
-        self.sm.read(read).await
+    pub async fn read<F, R>(&self, read: F) -> Result<R, io::Error>
+    where
+        F: FnOnce(&T) -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        self.raft.with_state_machine(|sm| Box::pin(sm.read(read))).await.map_err(io::Error::other)
     }
 
     /// Wait until a local read would be linearizable

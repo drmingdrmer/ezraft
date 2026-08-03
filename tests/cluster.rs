@@ -418,7 +418,7 @@ async fn learner_joins_and_stays_a_learner_until_promoted() -> io::Result<()> {
     );
 
     // A learner is a full replica; it just does not vote.
-    assert_eq!(expected_map(1..3), b.read(|app| app.data.clone()).await);
+    assert_eq!(expected_map(1..3), b.read(|app| app.data.clone()).await?);
 
     // A node the cluster has never heard of cannot be promoted.
     let unknown = a.promote(b_id + 1000).await.unwrap_err();
@@ -505,7 +505,7 @@ async fn snapshot_survives_restart() -> io::Result<()> {
     // After the linearizable barrier, a local read must serve every write
     // acknowledged before the shutdown.
     restarted.linearizable().await?;
-    assert_eq!(expected_map(0..15), restarted.read(|app| app.data.clone()).await);
+    assert_eq!(expected_map(0..15), restarted.read(|app| app.data.clone()).await?);
 
     // And the restarted node serves reads over the rebuilt state.
     assert_eq!(
@@ -572,7 +572,7 @@ async fn lagging_joiner_catches_up_from_snapshot() -> io::Result<()> {
     wait_for_voters(&b, voters, "snapshot-fed joiner promoted to voter").await?;
 
     // The whole pre-purge state must have arrived through the snapshot.
-    assert_eq!(expected_map(0..10), b.read(|app| app.data.clone()).await);
+    assert_eq!(expected_map(0..10), b.read(|app| app.data.clone()).await?);
 
     // And the pair keeps working past the transfer.
     assert_eq!(Response { value: None }, http_write(&addr_b, set("k10", "v10")).await?);
@@ -667,7 +667,7 @@ async fn demoted_voter_becomes_a_learner_and_keeps_replicating() -> io::Result<(
     // their own, and the demoted node is still sent what they commit.
     assert_eq!(Response { value: None }, a.write(set("k1", "v1")).await?);
     wait_for_applied(&c, &a).await?;
-    assert_eq!(expected_map(1..2), c.read(|app| app.data.clone()).await);
+    assert_eq!(expected_map(1..2), c.read(|app| app.data.clone()).await?);
 
     Ok(())
 }
@@ -991,7 +991,7 @@ async fn restart_after_a_snapshot_with_no_log_after_it() -> io::Result<()> {
     // Only now can the leader reach it, and only a snapshot can catch it up.
     spawn_serve(&c);
     wait_for_applied(&c, &a).await?;
-    assert_eq!(expected_map(0..10), c.read(|app| app.data.clone()).await);
+    assert_eq!(expected_map(0..10), c.read(|app| app.data.clone()).await?);
 
     let meta = disk_c.disk.lock().unwrap().meta.clone();
     assert!(
