@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.2.1
+
+Documentation only; no code changed.
+
+- The README is a landing page now: what the crate is, one service
+  written whole, and the curl calls that drive it. The tutorial it used
+  to carry - running a cluster, the two user traits, the API,
+  configuration, endpoints and troubleshooting - moved to
+  [`docs/guide.md`](docs/guide.md).
+
 ## v0.2.0
 
 Two features:
