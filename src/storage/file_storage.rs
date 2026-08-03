@@ -30,8 +30,13 @@ use crate::storage::Persist;
 /// ```text
 /// <base_dir>/meta.json        Raft metadata (node id, vote, log positions)
 /// <base_dir>/logs/log-<idx>   one log entry per file
-/// <base_dir>/snapshot         snapshot metadata on the first line, application state after it
+/// <base_dir>/snapshot         length-prefixed snapshot metadata, then application state
 /// ```
+///
+/// The snapshot file is the one thing here that is not plain JSON: eight big-endian bytes giving
+/// the length of the metadata, the metadata JSON, then the application state. A length says where
+/// the metadata ends whatever it contains, which a separator cannot - both halves are bytes this
+/// file does not get to constrain.
 ///
 /// A snapshot is one file because its two halves must not be mixed: metadata naming a log
 /// position the state next to it does not cover would make startup skip the entries in between.
@@ -135,16 +140,20 @@ where T: EzApp
         // Load snapshot (optional)
         let snapshot = match fs::read(&self.snapshot_path()).await {
             Ok(file) => {
-                // The metadata line ends at the first newline: JSON escapes the newlines inside
-                // it, so the first raw one is where the application state begins.
-                let Some(end_of_meta) = file.iter().position(|byte| *byte == b'\n') else {
-                    return Err(io::Error::other("snapshot file has no metadata line"));
-                };
+                let (meta_len, rest) = split_meta_len(&file)?;
+                if rest.len() < meta_len {
+                    return Err(io::Error::other(format!(
+                        "snapshot file claims {} bytes of metadata, {} bytes follow the length",
+                        meta_len,
+                        rest.len()
+                    )));
+                }
 
-                let snap_meta: EzSnapshotMeta = serde_json::from_slice(&file[..end_of_meta])?;
+                let (meta_bytes, data) = rest.split_at(meta_len);
+                let snap_meta: EzSnapshotMeta = serde_json::from_slice(meta_bytes)?;
                 Some(EzSnapshot {
                     meta: snap_meta,
-                    snapshot: Cursor::new(file[end_of_meta + 1..].to_vec()),
+                    snapshot: Cursor::new(data.to_vec()),
                 })
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => None,
@@ -165,10 +174,12 @@ where T: EzApp
                 fs::write(self.log_path(index), serde_json::to_vec(&entry)?).await?;
             }
             Persist::Snapshot(snapshot) => {
-                let mut file = serde_json::to_vec(&snapshot.meta)?;
-                file.push(b'\n');
+                let meta_bytes = serde_json::to_vec(&snapshot.meta)?;
 
-                // Extract data from cursor, appending it after the metadata line
+                let mut file = (meta_bytes.len() as u64).to_be_bytes().to_vec();
+                file.extend_from_slice(&meta_bytes);
+
+                // Extract data from cursor, appending it after the metadata
                 let mut cursor = snapshot.snapshot;
                 cursor.seek(SeekFrom::Start(0))?;
                 cursor.read_to_end(&mut file)?;
@@ -192,6 +203,29 @@ where T: EzApp
 
         Ok(logs)
     }
+}
+
+/// Read the snapshot file's leading metadata length, and return it with the bytes after it
+fn split_meta_len(file: &[u8]) -> Result<(usize, &[u8]), io::Error> {
+    const LEN_BYTES: usize = size_of::<u64>();
+
+    if file.len() < LEN_BYTES {
+        return Err(io::Error::other(format!(
+            "snapshot file is {} bytes, too short for a {}-byte metadata length",
+            file.len(),
+            LEN_BYTES
+        )));
+    }
+
+    let (len, rest) = file.split_at(LEN_BYTES);
+    let len = u64::from_be_bytes(len.try_into().expect("split at the width of a u64"));
+
+    // A length wider than a `usize` cannot address anything this process can hold, and a file that
+    // claims one is not a snapshot this build wrote.
+    let len =
+        usize::try_from(len).map_err(|_| io::Error::other(format!("snapshot metadata length {} is absurd", len)))?;
+
+    Ok((len, rest))
 }
 
 #[cfg(test)]
@@ -267,6 +301,16 @@ mod tests {
         storage.persist(op).await.unwrap();
     }
 
+    /// A snapshot file as `persist` lays it out: the metadata length, the metadata, the state
+    fn framed(snapshot: EzSnapshot) -> Vec<u8> {
+        let meta_bytes = serde_json::to_vec(&snapshot.meta).unwrap();
+
+        let mut file = (meta_bytes.len() as u64).to_be_bytes().to_vec();
+        file.extend_from_slice(&meta_bytes);
+        file.extend_from_slice(snapshot.snapshot.get_ref());
+        file
+    }
+
     /// The bug this guards: metadata and state used to be two files written one after the other,
     /// so a process that died in between published the new metadata over the old state. Startup
     /// accepted that pair and reported a `last_log_id` the state did not cover, letting openraft
@@ -280,10 +324,7 @@ mod tests {
 
         persist(&dir, Persist::Snapshot(snapshot(10, b"first"))).await;
 
-        let mut interrupted = serde_json::to_vec(&snapshot(20, b"").meta).unwrap();
-        interrupted.push(b'\n');
-        interrupted.extend_from_slice(b"second");
-        fs::write(dir.join("snapshot.tmp"), interrupted).await.unwrap();
+        fs::write(dir.join("snapshot.tmp"), framed(snapshot(20, b"second"))).await.unwrap();
 
         let (_meta, loaded) = load(&dir).await;
         assert_eq!(Some((snapshot(10, b"first").meta, b"first".to_vec())), loaded);
@@ -305,17 +346,47 @@ mod tests {
         fs::remove_dir_all(&dir).await.unwrap();
     }
 
-    /// The metadata line ends at the first newline, so state containing newlines of its own must
-    /// come back byte for byte.
+    /// The metadata is found by its length, not by a separator, so the state is opaque: newlines,
+    /// null bytes and something that looks like a length header of its own all come back untouched.
     #[tokio::test]
-    async fn snapshot_state_holding_newlines_round_trips() {
-        let dir = test_dir("newline-snapshot").await;
+    async fn snapshot_state_is_returned_byte_for_byte() {
+        let dir = test_dir("opaque-snapshot").await;
 
-        let data = b"{\n  \"count\": 7\n}\n";
+        let data = b"\0\0\0\0\0\0\0\x07{\n  \"count\": 7\n}\n";
         persist(&dir, Persist::Snapshot(snapshot(10, data))).await;
 
         let (_meta, loaded) = load(&dir).await;
         assert_eq!(Some((snapshot(10, data).meta, data.to_vec())), loaded);
+
+        fs::remove_dir_all(&dir).await.unwrap();
+    }
+
+    /// A file too short to hold the length, or one whose length runs past its own end, is reported
+    /// rather than sliced into: a half-written snapshot must not be read as a whole one.
+    ///
+    /// Only the metadata is framed, so state cut short is not detectable here - it simply runs to
+    /// the end of the file. It does not have to be: a snapshot becomes visible by rename, so a
+    /// published file is one that was written whole.
+    #[tokio::test]
+    async fn a_snapshot_file_shorter_than_it_claims_is_refused() {
+        let dir = test_dir("truncated-snapshot").await;
+        let whole = framed(snapshot(10, b"state"));
+        let meta_len = whole.len() - size_of::<u64>() - b"state".len();
+
+        // Too short to hold the length at all, then cut inside the metadata the length describes.
+        for cut in [4, size_of::<u64>() + meta_len - 3] {
+            fs::create_dir_all(&dir).await.unwrap();
+            fs::write(dir.join("snapshot"), &whole[..cut]).await.unwrap();
+
+            let mut storage = FileStorage::new(&dir).await.unwrap();
+            let err = EzStorage::<Counter>::load(&mut storage).await.expect_err("a truncated file is refused");
+            assert!(
+                err.to_string().contains("snapshot file"),
+                "cut at {}: unexpected error: {}",
+                cut,
+                err
+            );
+        }
 
         fs::remove_dir_all(&dir).await.unwrap();
     }
