@@ -1,9 +1,11 @@
 # Changelog
 
-## Unreleased
+## v0.2.0
 
-Learner support. A node can join and stay a learner, and any member can be
-moved between voter and learner or taken out of the cluster.
+Learner support, and an `EzApp` that asks for less. A node can join and stay a
+learner, and any member can be moved between voter and learner or taken out of
+the cluster. A read now takes the app's own request and response types, and a
+request no longer needs a hand-written `Display`.
 
 Breaking:
 
