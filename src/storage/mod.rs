@@ -4,7 +4,7 @@
 //! keeps. Read its caveats before reaching for it, and implement [`EzStorage`] yourself once
 //! they matter.
 
-pub mod adapter;
+pub(crate) mod adapter;
 mod file_storage;
 mod loaded;
 mod persist;

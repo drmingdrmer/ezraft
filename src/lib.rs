@@ -131,13 +131,13 @@ pub mod app;
 pub mod config;
 pub mod entry;
 pub mod meta;
-pub mod network;
+mod network;
 pub mod node_role;
 pub mod raft;
 pub mod server;
 pub mod snapshot;
 pub mod storage;
-pub mod type_config;
+mod type_config;
 
 // Re-export public API
 pub use app::EzApp;
