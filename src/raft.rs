@@ -24,7 +24,6 @@ use crate::config::EzConfig;
 use crate::network::EzNetworkFactory;
 use crate::node_role::NodeRole;
 use crate::storage::EzStorage;
-use crate::storage::adapter::LogStore;
 use crate::storage::adapter::StateMachineStore;
 use crate::storage::adapter::open;
 use crate::type_config::OpenRaftTypes;
@@ -60,9 +59,6 @@ where T: EzApp
     /// HTTP bind address
     addr: String,
 
-    /// The log, for the metadata this node keeps outside Raft's own state
-    log: LogStore<T>,
-
     /// Internal OpenRaft instance
     raft: ORRaft<T>,
 
@@ -81,7 +77,6 @@ where T: EzApp
         Self {
             node_id: self.node_id,
             addr: self.addr.clone(),
-            log: self.log.clone(),
             raft: self.raft.clone(),
             promotion: self.promotion.clone(),
         }
@@ -231,8 +226,6 @@ where T: EzApp
             id
         };
 
-        let log_store = log.clone();
-
         // Convert EzConfig to OpenRaft Config
         let raft_config = config.to_raft_config()?;
         let raft_config = Arc::new(raft_config);
@@ -241,7 +234,7 @@ where T: EzApp
         let network = EzNetworkFactory::new()?;
 
         // Create OpenRaft instance
-        let raft = Raft::new(node_id, raft_config, network, log_store, sm)
+        let raft = Raft::new(node_id, raft_config, network, log, sm)
             .await
             .map_err(|e| io::Error::other(e.to_string()))?;
 
@@ -270,7 +263,6 @@ where T: EzApp
         Ok(Self {
             node_id,
             addr: http_addr,
-            log,
             raft,
             promotion: Arc::new(Mutex::new(promotion)),
         })
