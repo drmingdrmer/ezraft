@@ -14,15 +14,25 @@ for, and EzRaft reduces it to two traits: `EzApp` holds your state and applies r
 to it, `EzStorage` puts bytes on disk. Elections, replication, membership, snapshots and
 the transport between machines are handled internally.
 
-- **Minimal user API**: 4 methods total (3 storage + 1 app) vs 21+ in OpenRaft
-- **Smart defaults**: 10/12 Raft types pre-configured, users specify only Request/Response
-- **Built-in networking**: HTTP layer included, no user code needed
-- **Type-safe**: Works directly with your types, not byte vectors
+Where to draw that line is the point of the crate: EzRaft is a search for the smallest
+API that is still enough to build a distributed key-value store on Raft.
+
+The way to judge an API is to build with it, so the example here is a whole working
+service. If a part of it feels heavier than the job deserves, that is worth reporting.
+
+- **Two methods**: `apply()` performs a write, `read()` answers a read - each with a
+  request and a response type you choose. That is the whole application interface.
+- **Your own types**: requests, responses and state are your structs. Serde moves them
+  between nodes; nothing here deals in byte vectors.
+- **Storage included**: `FileStorage` persists to disk out of the box. Writing your own
+  is three methods.
+- **Networking included**: every node serves the Raft RPCs its peers need and an HTTP
+  API for your app. There is no transport to write.
 
 ## Example
 
-A replicated key-value service, whole. `FileStorage` is the bundled `EzStorage`, so the
-application is all that is left to write:
+A replicated key-value service, whole. First the application: the two methods above,
+and the four types they carry.
 
 ```rust
 #[derive(Serialize, Deserialize, Debug, Clone, derive_more::Display)]
@@ -57,7 +67,12 @@ impl EzApp for KvApp {
         self.data.get(&key).cloned()
     }
 }
+```
 
+Then `main`, which is where the cluster comes from. `FileStorage` is the bundled
+`EzStorage`, so there is nothing else to implement:
+
+```rust
 /// One binary, run once per machine: `kvstore <own-addr> [addr of a node already in it]`
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
@@ -105,9 +120,9 @@ curl 127.0.0.1:8080/api/metrics   # leader, term, log index, membership
 
 ## Status
 
-**Experimental.** EzRaft is primarily an API design laboratory for exploring intuitive
-interface patterns. The APIs may change until the crate stabilizes. Production
-applications are not the primary audience.
+**Experimental.** The API is the thing being searched for, so it changes until the
+crate stabilizes. A real service built on it is the feedback the search needs most -
+pin the version, and read the CHANGELOG before upgrading.
 
 **Next phase: Stable API.** Once the design exploration matures, EzRaft will provide a
 stable API with well-considered abstractions - exposing what users need while hiding
