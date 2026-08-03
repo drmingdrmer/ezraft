@@ -404,8 +404,11 @@ where T: EzApp
     /// because it is a legitimate thing to intend, and Raft's answer to it is honest - the
     /// cluster stops committing until enough voters return.
     ///
-    /// Demoting the current leader is allowed. It commits the change and then steps down, and the
-    /// remaining voters elect one of their own.
+    /// Demoting the current leader is allowed, and it keeps leading. A Raft leader does not have to
+    /// be a voter: it commits the change and carries on committing, on a quorum of the voter set it
+    /// is no longer part of. The voters elect one of their own only once it stops. To stop leading,
+    /// hand leadership over - `raft.inner().trigger().transfer_leader(node_id)` - or shut the node
+    /// down; demoting it is not that.
     ///
     /// Leader only: on a follower this fails rather than looking for one.
     pub async fn demote(&self, node_id: u64) -> Result<(), io::Error> {
