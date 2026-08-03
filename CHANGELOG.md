@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.2.2
+
+Documentation only; no code changed.
+
+- The README says what the crate is for: a search for the smallest API
+  that is still enough to build a distributed key-value store on Raft,
+  judged by building with it. The feature list describes that API in its
+  own terms rather than counting methods against OpenRaft's, and the
+  example is split into the application and the `main` that starts a
+  cluster.
+
 ## v0.2.1
 
 Documentation only; no code changed.
