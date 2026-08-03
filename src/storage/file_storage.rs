@@ -402,7 +402,6 @@ mod tests {
             vote: Some(EzVote::new(3, 7)),
             last_log_id: Some((3, 42)),
             last_purged: None,
-            promotion_pending: true,
         };
         persist(&dir, Persist::Meta(meta.clone())).await;
 

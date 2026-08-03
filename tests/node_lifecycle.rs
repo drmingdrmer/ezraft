@@ -76,43 +76,46 @@ async fn a_join_with_an_unusable_config_leaves_the_cluster_untouched() -> io::Re
     Ok(())
 }
 
-/// Joining is two steps - enter the membership as a learner, then be promoted - and a process
-/// that dies between them leaves a learner the cluster has no reason to promote on its own. The
-/// promotion still owed is persisted, so the restart asks for it again instead of silently
-/// running on as the learner the caller never asked to be.
+/// Joining is two steps - enter the membership as a learner, then be promoted - and a process that
+/// dies between them comes back a learner. Restarting repeats neither step: the id is persisted, so
+/// the seed is not asked again, and a node is whatever the membership says it is. The promotion is
+/// retried the way any learner is promoted, with `promote` on the leader.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_join_that_died_before_its_promotion_resumes_on_restart() -> io::Result<()> {
+async fn a_failed_promotion_is_finished_by_promote_not_by_restarting() -> io::Result<()> {
     let (seed, seed_node) = founding_node().await?;
 
-    // The first incarnation gets as far as the membership: a learner, with a promotion recorded
-    // as still owed. Joining as a learner and marking the intent by hand is that state exactly,
-    // without a background promotion left over to confuse what the restart does.
+    // A learner in the membership with its id persisted is exactly the state a join whose
+    // promotion never landed leaves behind.
     let addr = free_addr();
     let storage = MemStorage::default();
     let first = EzRaft::join_as_learner(&addr, &seed, KvSm::default(), storage.clone(), config()).await?;
     let node_id = first.node_id();
     drop(first);
 
-    {
-        let mut disk = storage.disk.lock().unwrap();
-        assert!(!disk.meta.promotion_pending, "a learner join asks for no promotion");
-        disk.meta.promotion_pending = true;
-    }
-
-    // Restarting with the same call the join used, as a restart always does.
+    // Restarting as a voter join, which is what the caller who wanted a voter would run again.
     let restarted = EzRaft::join(&addr, &seed, KvSm::default(), storage.clone(), config()).await?;
     spawn_serve(&restarted);
 
+    // Being caught up is the only thing a promotion waits for, so a restart that meant to promote
+    // would have done it by now.
+    seed_node.write(set("k1", "v1")).await?;
+    wait_for_applied(&restarted, &seed_node).await?;
+
+    let membership = seed_node.metrics().await.committed_membership_config.membership().clone();
+    assert_eq!(BTreeSet::from([0]), membership.voter_ids().collect::<BTreeSet<_>>());
+    assert_eq!(
+        BTreeSet::from([node_id]),
+        membership.learner_ids().collect::<BTreeSet<_>>(),
+        "a restart repeats neither step of the join"
+    );
+
+    // And the retry is a plain promotion.
+    seed_node.promote(node_id).await?;
+
     let voters = BTreeSet::from([0, node_id]);
     for node in [&seed_node, &restarted] {
-        wait_for_voters(node, voters.clone(), "the resumed promotion made it a voter").await?;
+        wait_for_voters(node, voters.clone(), "the retried promotion made it a voter").await?;
     }
-
-    // And the intent is spent: from here this node is whatever the membership says.
-    assert!(
-        !storage.disk.lock().unwrap().meta.promotion_pending,
-        "a confirmed promotion clears what it satisfied"
-    );
 
     Ok(())
 }

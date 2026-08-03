@@ -145,15 +145,15 @@ where T: EzApp
     ///
     /// The seed does not have to be the leader.
     ///
-    /// On restart the persisted id is reused and the seed is not contacted: a node that has
-    /// already joined is whatever the cluster's membership says it is, so restarting a node that
-    /// was deliberately left a learner, or one demoted after being promoted, does not quietly make
-    /// it a voter. Passing an address that has since left the cluster is therefore harmless too.
+    /// On restart the persisted id is reused, the seed is not contacted, and no promotion is
+    /// started: a node that has already joined is whatever the cluster's membership says it is,
+    /// so restarting a node that was deliberately left a learner does not quietly make it a
+    /// voter. Passing an address that has since left the cluster is therefore harmless too.
     ///
-    /// The exception is a join that never finished. Entering the membership and being promoted are
-    /// two steps, and a process that died between them left a learner behind that the cluster has
-    /// no reason to promote on its own. That this node is still owed a promotion is persisted with
-    /// its id, so restarting asks for it again - and then the seed does have to answer.
+    /// A promotion that failed therefore stays failed, leaving this node the learner it already
+    /// became: entering the membership and being promoted are two steps, and restarting repeats
+    /// neither. Finish it with [`Self::promote`] on the leader, which is the same call an operator
+    /// uses to promote any learner.
     ///
     /// # Arguments
     ///
@@ -204,19 +204,12 @@ where T: EzApp
         let (log, sm) = open(storage, app).await?;
 
         // Determine node_id, and whether a promotion has to follow. A node that already has an id
-        // has joined before, so the seed does not apply to it again: what it is now, the
-        // membership decides - unless the join it came back from never finished.
+        // has joined before, so neither the seed nor the promotion applies to it again: what it
+        // is now, the membership decides.
         let mut promote_via = None;
 
         let node_id = if let Some(id) = log.node_id().await {
             // Use persisted node_id (restart case)
-            if let (true, Some((seed_addr, NodeRole::Voter))) = (log.promotion_pending().await, &seed) {
-                // The previous incarnation entered the membership as a learner and died before
-                // its promotion was confirmed. Asking again is the only way that intent survives;
-                // a node whose promotion did land has nothing recorded here, so one that was
-                // demoted afterwards is not quietly promoted back.
-                promote_via = Some(AdminClient::new(seed_addr));
-            }
             id
         } else if let Some((seed_addr, role)) = &seed {
             // Join existing cluster via seed node: take an id, then enter the membership as a
@@ -231,18 +224,9 @@ where T: EzApp
                 addr: http_addr.clone(),
             };
             admin.membership(enter).await?;
+            log.save_meta(|m| m.node_id = Some(id)).await?;
 
-            // The id and the promotion still owed are recorded together: between the learner this
-            // node has become and the voter it asked to be, everything that can go wrong leaves
-            // the cluster changed, so the intent has to outlive the process.
-            let wants_voter = *role == NodeRole::Voter;
-            log.save_meta(|m| {
-                m.node_id = Some(id);
-                m.promotion_pending = wants_voter;
-            })
-            .await?;
-
-            if wants_voter {
+            if *role == NodeRole::Voter {
                 promote_via = Some(admin);
             }
             id
@@ -252,10 +236,6 @@ where T: EzApp
             log.save_meta(|m| m.node_id = Some(id)).await?;
             id
         };
-
-        // Cloned before openraft takes the store, so the promotion can clear the intent it
-        // satisfies.
-        let promotion_log = log.clone();
 
         // Create network factory
         let network = EzNetworkFactory::new()?;
@@ -284,13 +264,7 @@ where T: EzApp
                 role: NodeRole::Voter,
             };
 
-            tokio::spawn(async move {
-                admin.membership(promote).await?;
-
-                // Nothing is owed any more, so a later start is a plain restart: this node is
-                // whatever the membership says, promotion or demotion included.
-                promotion_log.save_meta(|m| m.promotion_pending = false).await
-            })
+            tokio::spawn(async move { admin.membership(promote).await })
         });
 
         Ok(Self {
