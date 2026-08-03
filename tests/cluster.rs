@@ -55,6 +55,26 @@ fn get(key: &str) -> Request {
 #[derive(Default, Serialize, Deserialize)]
 struct KvSm {
     data: BTreeMap<String, String>,
+
+    /// Which bucket of `APPLIED` this state records its applies in, empty unless a test asked
+    /// for them. Part of the serialized state, so it survives a snapshot restore and a restart
+    /// and replayed applies land in the same bucket as the originals.
+    #[serde(default)]
+    tag: String,
+}
+
+/// Every `apply` this process ran, in order, per tag
+static APPLIED: Mutex<BTreeMap<String, Vec<String>>> = Mutex::new(BTreeMap::new());
+
+fn tagged(tag: &str) -> KvSm {
+    KvSm {
+        tag: tag.into(),
+        ..KvSm::default()
+    }
+}
+
+fn applied(tag: &str) -> Vec<String> {
+    APPLIED.lock().unwrap().get(tag).cloned().unwrap_or_default()
 }
 
 #[async_trait]
@@ -63,6 +83,10 @@ impl EzApp for KvSm {
     type Response = Response;
 
     async fn apply(&mut self, req: Request) -> Response {
+        if !self.tag.is_empty() {
+            APPLIED.lock().unwrap().entry(self.tag.clone()).or_default().push(req.to_string());
+        }
+
         match req {
             Request::Set { key, value } => {
                 self.data.insert(key, value);
@@ -635,6 +659,75 @@ async fn snapshot_survives_restart() -> io::Result<()> {
         },
         restarted.write(get("k14")).await?
     );
+
+    Ok(())
+}
+
+/// `apply` is not exactly-once per entry, and the trait documents it as replayable because of
+/// this: a restart resumes applying at the snapshot, so every entry after it reaches `apply`
+/// again. An app that acted on the outside world in there would act twice.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restart_reapplies_the_entries_after_the_snapshot() -> io::Result<()> {
+    let addr = free_addr();
+    let storage = MemStorage::default();
+
+    let a = EzRaft::create(&addr, tagged("replay"), storage.clone(), config()).await?;
+    a.inner()
+        .wait(WAIT)
+        .metrics(|m| m.current_leader == Some(0), "single node leads")
+        .await
+        .map_err(io::Error::other)?;
+
+    for i in 0..10 {
+        a.write(set(&format!("k{}", i), &format!("v{}", i))).await?;
+    }
+
+    a.inner().trigger().snapshot().await.map_err(io::Error::other)?;
+    a.inner()
+        .wait(WAIT)
+        .metrics(|m| m.snapshot.is_some(), "snapshot built")
+        .await
+        .map_err(io::Error::other)?;
+
+    // These land after the snapshot, so they are the ones a restart has to replay.
+    for i in 10..15 {
+        a.write(set(&format!("k{}", i), &format!("v{}", i))).await?;
+    }
+
+    let first_run: Vec<String> = (0..15).map(|i| format!("Set(k{})", i)).collect();
+    assert_eq!(first_run, applied("replay"), "each write applied once while running");
+
+    a.inner().shutdown().await.map_err(io::Error::other)?;
+    drop(a);
+
+    // Restart on the same disk with an empty state machine: the snapshot restores the state up
+    // to k9, and the log carries k10..k15 back through `apply`.
+    let restarted = EzRaft::create(&addr, tagged("replay"), storage.clone(), config()).await?;
+    restarted
+        .inner()
+        .wait(WAIT)
+        .metrics(|m| m.current_leader == Some(0), "restarted node leads")
+        .await
+        .map_err(io::Error::other)?;
+    restarted
+        .inner()
+        .wait(WAIT)
+        .metrics(
+            |m| m.last_applied.map(|log_id| log_id.index) == m.last_log_index,
+            "log tail replayed",
+        )
+        .await
+        .map_err(io::Error::other)?;
+
+    let replayed: Vec<String> = (10..15).map(|i| format!("Set(k{})", i)).collect();
+    assert_eq!(
+        [first_run, replayed].concat(),
+        applied("replay"),
+        "the entries after the snapshot ran twice"
+    );
+
+    // Replaying them a second time is what makes the state whole again.
+    assert_eq!(expected_map(0..15), restarted.read(|app| app.data.clone()).await?);
 
     Ok(())
 }
