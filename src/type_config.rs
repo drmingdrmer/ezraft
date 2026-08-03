@@ -14,7 +14,6 @@ use openraft::impls::OneshotResponder;
 use openraft::impls::leader_id_std::LeaderId;
 
 use crate::app::EzApp;
-use crate::entry::EzRequest;
 
 /// Wrapper type that implements `RaftTypeConfig` for any `T: EzApp`
 ///
@@ -80,7 +79,7 @@ where T: EzApp
 impl<T> RaftTypeConfig for OpenRaftTypes<T>
 where T: EzApp
 {
-    type D = EzRequest<T::Request>;
+    type D = T::Request;
     // `None` answers framework-generated entries (blank, membership); every user request is
     // answered with `Some` by the state machine.
     type R = Option<T::Response>;

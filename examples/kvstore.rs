@@ -47,9 +47,11 @@ use tracing_subscriber::EnvFilter;
 // `POST /api/read` (or `EzRaft::read` in code) with no consensus round and no log
 // entry. The alternative - a `Get` variant applied through the log - is worth its
 // cost only when a read must be linearizable from any node, not just the leader.
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, derive_more::Display)]
 pub enum Request {
+    #[display("Set({key})")]
     Set { key: String, value: String },
+    #[display("Delete({key})")]
     Delete { key: String },
 }
 

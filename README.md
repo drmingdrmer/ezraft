@@ -135,9 +135,10 @@ use serde::Deserialize;
 use serde::Serialize;
 
 /// What a client asks the cluster to do. It travels the network and goes into
-/// the log, hence serde; it is named in logs, hence Debug.
-#[derive(Serialize, Deserialize, Debug, Clone)]
+/// the log, hence serde; openraft prints it in its logs, hence Display.
+#[derive(Serialize, Deserialize, Debug, Clone, derive_more::Display)]
 enum Request {
+    #[display("Set({key})")]
     Set { key: String, value: String },
 }
 
