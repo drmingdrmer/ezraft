@@ -9,16 +9,15 @@ A beginner-friendly Raft consensus framework built on
 [OpenRaft](https://github.com/databendlabs/openraft).
 
 Run your application on several machines at once, all holding the same state, so the
-service survives losing some of them. That is what [Raft](https://raft.github.io/) is
-for, and EzRaft reduces it to two traits: `EzApp` holds your state and applies requests
-to it, `EzStorage` puts bytes on disk. Elections, replication, membership, snapshots and
-the transport between machines are handled internally.
+service survives losing some of them. That is [Raft](https://raft.github.io/); EzRaft
+reduces it to two traits: `EzApp` holds your state and applies requests to it,
+`EzStorage` puts bytes on disk. Elections, replication, membership, snapshots and
+transport are internal.
 
-Where to draw that line is the point of the crate: EzRaft is a search for the smallest
-API that is still enough to build a distributed key-value store on Raft.
-
-The way to judge an API is to build with it, so the example here is a whole working
-service. If a part of it feels heavier than the job deserves, that is worth reporting.
+Where to draw that line is the point of the crate - a search for the smallest API still
+enough to build a distributed key-value store. An API is judged by building with it, so
+the example below is a whole working service; if part of it weighs more than the job
+deserves, that is worth reporting.
 
 - **Two methods**: `apply()` performs a write, `read()` answers a read - each with a
   request and a response type you choose. That is the whole application interface.
