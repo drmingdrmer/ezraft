@@ -1,4 +1,4 @@
-# EzRaft
+<img src="logo.png" alt="EzRaft" width="320">
 
 [![CI](https://github.com/drmingdrmer/ezraft/actions/workflows/ci.yaml/badge.svg)](https://github.com/drmingdrmer/ezraft/actions/workflows/ci.yaml)
 [![Crates.io](https://img.shields.io/crates/v/ezraft.svg)](https://crates.io/crates/ezraft)
