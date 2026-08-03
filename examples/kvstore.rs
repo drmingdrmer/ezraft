@@ -71,9 +71,6 @@ pub enum ReadRequest {
     Prefix { prefix: String },
 }
 
-// The entries the read matched, empty when none did.
-pub type ReadResponse = BTreeMap<String, String>;
-
 // The application: its state plus one method of business logic.
 // Snapshots are derived from the state via serde, hence the serde derives.
 #[derive(Default, Serialize, Deserialize)]
@@ -103,11 +100,11 @@ impl EzApp for KvApp {
     }
 
     type ReadRequest = ReadRequest;
-    type ReadResponse = ReadResponse;
+    type ReadResponse = BTreeMap<String, String>;
 
     // Serves `POST /api/read` straight from the map. Both variants are indexed lookups, not
     // scans: `range` starts the walk at the prefix instead of at the first key.
-    fn read(&self, req: ReadRequest) -> ReadResponse {
+    fn read(&self, req: ReadRequest) -> BTreeMap<String, String> {
         match req {
             ReadRequest::Get { key } => self.data.get(&key).map(|value| (key, value.clone())).into_iter().collect(),
             ReadRequest::Prefix { prefix } => self
