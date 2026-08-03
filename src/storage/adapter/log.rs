@@ -71,6 +71,11 @@ where T: EzApp
     pub async fn node_id(&self) -> Option<u64> {
         self.meta.lock().await.node_id
     }
+
+    /// Whether a promotion this node asked for is still owed to it
+    pub async fn promotion_pending(&self) -> bool {
+        self.meta.lock().await.promotion_pending
+    }
 }
 
 /// Write metadata out, with the log positions made consistent first

@@ -23,4 +23,13 @@ pub struct EzMeta {
 
     /// Last purged log entry (term, index)
     pub last_purged: Option<EzLogId>,
+
+    /// Whether this node asked to be a voter and has not seen it happen yet
+    ///
+    /// Set by [`EzRaft::join`](crate::EzRaft::join) once the cluster has this node as a learner,
+    /// cleared once the promotion to voter is confirmed. It is what tells the two apart on the
+    /// next start: a join that never finished resumes its promotion, while a node that finished
+    /// one and was demoted later stays the learner the membership says it is.
+    #[serde(default)]
+    pub promotion_pending: bool,
 }
