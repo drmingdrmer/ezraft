@@ -266,7 +266,7 @@ yourself for anything past a demo. Its source is the worked example of doing so.
 | `linearizable()` | Leader only: confirms leadership with a quorum round-trip and waits for local state to catch up, so a `read` after it sees every acknowledged write. |
 | `metrics()`, `is_leader()`, `node_id()`, `addr()` | Current node and cluster state. |
 | `promote(node_id)` | Makes that learner a voter. Returns once it is one, so the call lasts as long as bringing it up to date takes. Fails while another membership change is in flight - a cluster admits one at a time - and on an id that is not a learner. |
-| `demote(node_id)` | Makes that voter a learner. It keeps receiving the log, it stops being counted in the quorum. Refuses to empty the voter set. |
+| `demote(node_id)` | Makes that voter a learner. It keeps receiving the log, it stops being counted in the quorum. Refuses to empty the voter set. Demoting the leader does not stop it leading - a leader need not be a voter, and it keeps committing on a quorum of the voters left. |
 | `remove_node(node_id)` | Takes a node out of the cluster, voter or learner. Does not stop the node's own process. |
 | `serve()` | Runs the HTTP server, and collects the promotion a `join` started - so a joining node must call it, and a promotion that fails is returned from here. Blocks, so spawn it - `tokio::spawn(raft.clone().serve())` - and start it early: peers reach a node only through this server. |
 | `inner()` | The openraft `Raft` underneath, for anything EzRaft does not wrap. |
@@ -277,8 +277,9 @@ node's - `POST /api/write` forwards, and the admin endpoints answer with the lea
 address. That keeps `EzRaft` a node, with no idea how to talk to another one.
 
 Every fallible method returns `std::io::Error`, including the ones that fail for reasons
-that have nothing to do with I/O: a caller cannot usefully branch on the difference, since
-`write` already finds the leader on its own. Code that does need typed errors reaches them
+that have nothing to do with I/O. Most callers have nothing to branch on: writing through
+`POST /api/write` means the forwarding is already done for them. Code that does need to act
+on a specific error - to follow a `ForwardToLeader` itself, say - reaches the typed errors
 through `inner()`.
 
 ## Configuration

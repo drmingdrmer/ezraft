@@ -118,8 +118,8 @@ where T: EzApp
     /// Raft transfer leadership RPC handler
     ///
     /// A leader hands leadership over rather than stopping and leaving the cluster to notice its
-    /// silence: an election costs a timeout, a transfer costs a round trip. A leader demoted out
-    /// of the voter set does this on its way out.
+    /// silence: an election costs a timeout, a transfer costs a round trip. A leader removed from
+    /// the cluster does this on its way out - one merely demoted keeps leading.
     async fn handle_transfer_leader(
         req: web::Json<raft::TransferLeaderRequest<C<T>>>,
         ez: Data<Self>,
