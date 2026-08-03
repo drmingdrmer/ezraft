@@ -52,7 +52,7 @@ use crate::entry::EzEntry;
 /// impl EzStorage<KvApp> for MyStorage {
 ///     async fn load(&mut self) -> Result<Loaded, io::Error> {
 ///         // 1. Load meta from base_dir/meta.json (use default if first run)
-///         // 2. Optionally load snapshot from base_dir/snapshot.meta + snapshot.data
+///         // 2. Optionally load snapshot from base_dir/snapshot
 ///         // Log entries are read separately via read_logs()
 ///         Ok(Loaded { meta, snapshot })
 ///     }
