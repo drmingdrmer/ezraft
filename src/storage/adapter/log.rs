@@ -259,14 +259,14 @@ mod tests {
     impl EzApp for Marker {
         type Request = String;
         type Response = String;
+        type ReadRequest = ();
+        type ReadResponse = ();
 
         async fn apply(&mut self, req: String) -> String {
             req
         }
 
-        fn read(&self, _key: &str) -> Option<serde_json::Value> {
-            None
-        }
+        fn read(&self, _req: ()) {}
     }
 
     /// Storage that records what it was asked to write, in the order it was asked

@@ -68,6 +68,8 @@
 //! impl EzApp for KvApp {
 //!     type Request = Request;
 //!     type Response = Response;
+//!     type ReadRequest = String;
+//!     type ReadResponse = Option<String>;
 //!
 //!     // Called once per committed entry, in log order, on every node.
 //!     async fn apply(&mut self, req: Request) -> Response {
@@ -78,9 +80,10 @@
 //!         }
 //!     }
 //!
-//!     // Optional: answers `GET /api/read?key=...` from local state.
-//!     fn read(&self, key: &str) -> Option<serde_json::Value> {
-//!         self.data.get(key).map(|v| serde_json::Value::String(v.clone()))
+//!     // Answers `POST /api/read` from local state. A read never enters the
+//!     // log, so its request type is the app's own to shape.
+//!     fn read(&self, key: String) -> Option<String> {
+//!         self.data.get(&key).cloned()
 //!     }
 //! }
 //!

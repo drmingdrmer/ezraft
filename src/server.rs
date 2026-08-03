@@ -18,7 +18,6 @@ use openraft::errors::RaftError;
 use openraft::errors::decompose::DecomposeResult;
 use openraft::raft;
 use openraft::raft::SnapshotResponse;
-use serde::Deserialize;
 
 use crate::admin::MembershipChange;
 use crate::admin::Redirect;
@@ -36,7 +35,7 @@ type C<T> = OpenRaftTypes<T>;
 ///
 /// This is both a working server and a sample to copy. The `/raft/*` routes and the admin
 /// handlers are what every deployment needs and can be taken as they are. The application
-/// routes cannot be: `POST /api/write` and `GET /api/read?key=...` are the smallest pair that
+/// routes cannot be: `POST /api/write` and `POST /api/read` are the smallest pair that
 /// exercises an app, not the API a real service exposes - that one has an endpoint per
 /// operation, with the path, parameters and encoding each operation deserves.
 ///
@@ -71,7 +70,7 @@ where T: EzApp
                 .route("/raft/transfer_leader", web::post().to(Self::handle_transfer_leader))
                 // Application API
                 .route("/api/write", web::post().to(Self::handle_write))
-                .route("/api/read", web::get().to(Self::handle_read))
+                .route("/api/read", web::post().to(Self::handle_read))
                 // Admin API
                 .route("/api/node_id", web::post().to(Self::handle_node_id))
                 .route("/api/membership", web::post().to(Self::handle_membership))
@@ -236,31 +235,24 @@ where T: EzApp
 
     /// Application read API handler
     ///
-    /// `GET /api/read?key=...` answers a keyed read from local memory via [`EzApp::read`]: the
-    /// write API puts keys in, this reads one back. `key` is required - a request without it is
-    /// a 400 - and a key the app does not hold is a 404.
+    /// `POST /api/read` answers a read from local memory via [`EzApp::read`]: the write API puts
+    /// state in, this reads it back. Body and answer are the app's own read types, so what a read
+    /// may ask for, and what "nothing found" looks like, are the app's to decide and not this
+    /// handler's to interpret.
     ///
     /// Reads cost no consensus round and no log entry, and are as fresh as this node's
     /// replication - a read that must be linearizable goes through [`EzRaft::write`] instead.
     async fn handle_read(
-        query: web::Query<ReadQuery>,
+        req: web::Json<T::ReadRequest>,
         ez: Data<Self>,
-    ) -> Result<web::Json<serde_json::Value>, actix_web::Error> {
-        // Cloned because the read runs on the state machine's own task, which as far as the
+    ) -> Result<web::Json<T::ReadResponse>, actix_web::Error> {
+        // Moved whole, because the read runs on the state machine's own task, which as far as the
         // compiler is concerned outlives this request.
-        let key = query.key.clone();
+        let req = req.into_inner();
 
-        let found =
-            ez.raft.read(move |app| app.read(&key)).await.map_err(actix_web::error::ErrorInternalServerError)?;
+        let resp = ez.raft.read(move |app| app.read(req)).await.map_err(actix_web::error::ErrorInternalServerError)?;
 
-        let Some(value) = found else {
-            return Err(actix_web::error::ErrorNotFound(format!(
-                "no value for key {:?}",
-                query.key
-            )));
-        };
-
-        Ok(web::Json(value))
+        Ok(web::Json(resp))
     }
 
     /// Metrics API handler
@@ -389,11 +381,4 @@ where T: EzApp {
     resp.json()
         .await
         .map_err(|e| std::io::Error::other(format!("failed to parse write response: {}", e)))
-}
-
-/// Query for [`EzServer::handle_read`]
-#[derive(Debug, Deserialize)]
-struct ReadQuery {
-    /// Key to read, passed to [`EzApp::read`]
-    key: String,
 }

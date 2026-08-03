@@ -96,28 +96,30 @@ async fn write(addr: &str, req: Value) -> io::Result<Value> {
 }
 
 /// Poll a node's direct-read endpoint until `key` serves exactly `expected`,
-/// where `None` is the 404 of a key the node does not hold. Getting there
-/// proves the state reached that node's own state machine.
-async fn wait_for_key(addr: &str, key: &str, expected: Option<&Value>) -> io::Result<()> {
+/// where `None` is a key the node does not hold - the app answers that with no
+/// entry. Getting there proves the state reached that node's own state machine.
+async fn wait_for_key(addr: &str, key: &str, expected: Option<&str>) -> io::Result<()> {
+    let client = reqwest::Client::new();
+    let want = expected.map_or_else(|| json!({}), |value| json!({ key: value }));
     let deadline = Instant::now() + WAIT;
     let mut last = None;
     loop {
         // An error is the node's HTTP server still binding; retry until the deadline.
-        if let Ok(resp) = reqwest::get(format!("http://{}/api/read?key={}", addr, key)).await {
-            let value = match resp.status() {
-                reqwest::StatusCode::NOT_FOUND => None,
-                status if status.is_success() => Some(resp.json().await.map_err(io::Error::other)?),
-                status => {
-                    return Err(io::Error::other(format!(
-                        "read {} from {} failed: {}",
-                        key, addr, status
-                    )));
-                }
-            };
-            if value.as_ref() == expected {
+        let get = json!({"Get": {"key": key}});
+        if let Ok(resp) = client.post(format!("http://{}/api/read", addr)).json(&get).send().await {
+            let status = resp.status();
+            if !status.is_success() {
+                return Err(io::Error::other(format!(
+                    "read {} from {} failed: {}",
+                    key, addr, status
+                )));
+            }
+
+            let entries: Value = resp.json().await.map_err(io::Error::other)?;
+            if entries == want {
                 return Ok(());
             }
-            last = Some(value);
+            last = Some(entries);
         }
         if Instant::now() >= deadline {
             return Err(io::Error::other(format!(
@@ -150,8 +152,8 @@ async fn three_node_kvstore_cluster_writes_and_reads() -> io::Result<()> {
     let c = spawn_node(&work_dir, &addr_c, Some(&addr_a))?;
 
     // Replication must deliver the pre-join write to both joiners.
-    wait_for_key(&addr_b, "k1", Some(&json!("v1"))).await?;
-    wait_for_key(&addr_c, "k1", Some(&json!("v1"))).await?;
+    wait_for_key(&addr_b, "k1", Some("v1")).await?;
+    wait_for_key(&addr_c, "k1", Some("v1")).await?;
 
     // Writes sent to joiners are forwarded to the leader: a set through one,
     // and a delete through the other returning the removed value.
@@ -171,11 +173,24 @@ async fn three_node_kvstore_cluster_writes_and_reads() -> io::Result<()> {
     );
 
     // Every node converges on the exact final state: the overwritten key reads
-    // back everywhere, and the deleted key is a 404 rather than a null.
+    // back everywhere, and the deleted key answers with no entry at all.
     for addr in [&addr_a, &addr_b, &addr_c] {
-        wait_for_key(addr, "k2", Some(&json!("v2b"))).await?;
+        wait_for_key(addr, "k2", Some("v2b")).await?;
         wait_for_key(addr, "k1", None).await?;
     }
+
+    // One read answering with every match, which is the shape a key-at-a-time
+    // request cannot express.
+    let prefixed: Value = reqwest::Client::new()
+        .post(format!("http://{}/api/read", addr_a))
+        .json(&json!({"Prefix": {"prefix": "k"}}))
+        .send()
+        .await
+        .map_err(io::Error::other)?
+        .json()
+        .await
+        .map_err(io::Error::other)?;
+    assert_eq!(json!({"k2": "v2b"}), prefixed);
 
     drop(a);
     drop(b);

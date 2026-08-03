@@ -24,7 +24,8 @@
 //! curl -X POST 127.0.0.1:8080/api/write -H 'Content-Type: application/json' \
 //!     -d '{"Set": {"key": "hello", "value": "world"}}'
 //!
-//! curl '127.0.0.1:8080/api/read?key=hello'
+//! curl -X POST 127.0.0.1:8080/api/read -H 'Content-Type: application/json' \
+//!     -d '{"Get": {"key": "hello"}}'
 //! ```
 
 use std::collections::BTreeMap;
@@ -43,7 +44,7 @@ use tracing_subscriber::EnvFilter;
 // Define application request types
 //
 // Reads are deliberately not requests: they are served from local state via
-// `GET /api/read` (or `EzRaft::read` in code) with no consensus round and no log
+// `POST /api/read` (or `EzRaft::read` in code) with no consensus round and no log
 // entry. The alternative - a `Get` variant applied through the log - is worth its
 // cost only when a read must be linearizable from any node, not just the leader.
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -58,6 +59,19 @@ pub struct Response {
     pub value: Option<String>,
 }
 
+// Define application read types
+//
+// A read never enters the log, so it is not bound to what a write can say: `Prefix` asks a
+// question the key-at-a-time write API has no way to phrase.
+#[derive(Serialize, Deserialize, Debug)]
+pub enum ReadRequest {
+    Get { key: String },
+    Prefix { prefix: String },
+}
+
+// The entries the read matched, empty when none did.
+pub type ReadResponse = BTreeMap<String, String>;
+
 // The application: its state plus one method of business logic.
 // Snapshots are derived from the state via serde, hence the serde derives.
 #[derive(Default, Serialize, Deserialize)]
@@ -69,6 +83,8 @@ struct KvApp {
 impl EzApp for KvApp {
     type Request = Request;
     type Response = Response;
+    type ReadRequest = ReadRequest;
+    type ReadResponse = ReadResponse;
 
     async fn apply(&mut self, req: Request) -> Response {
         match req {
@@ -86,10 +102,18 @@ impl EzApp for KvApp {
         }
     }
 
-    // Serves `GET /api/read?key=...` straight from the map - an indexed lookup,
-    // not a scan of the serialized state.
-    fn read(&self, key: &str) -> Option<serde_json::Value> {
-        self.data.get(key).map(|value| serde_json::Value::String(value.clone()))
+    // Serves `POST /api/read` straight from the map. Both variants are indexed lookups, not
+    // scans: `range` starts the walk at the prefix instead of at the first key.
+    fn read(&self, req: ReadRequest) -> ReadResponse {
+        match req {
+            ReadRequest::Get { key } => self.data.get(&key).map(|value| (key, value.clone())).into_iter().collect(),
+            ReadRequest::Prefix { prefix } => self
+                .data
+                .range(prefix.clone()..)
+                .take_while(|(key, _)| key.starts_with(&prefix))
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+        }
     }
 }
 
@@ -185,7 +209,12 @@ Write a key - any node accepts one, a follower forwards it to the leader:
         -d '{{"Set": {{"key": "hello", "value": "world"}}}}'
 
 Read it back - answered from this node's memory, no consensus round:
-    curl '{addr}/api/read?key=hello'
+    curl -X POST {addr}/api/read -H 'Content-Type: application/json' \
+        -d '{{"Get": {{"key": "hello"}}}}'
+
+Read every key sharing a prefix - a read the write API cannot phrase:
+    curl -X POST {addr}/api/read -H 'Content-Type: application/json' \
+        -d '{{"Prefix": {{"prefix": "he"}}}}'
 
 Cluster state - leader, term, log index, membership:
     curl {addr}/api/metrics

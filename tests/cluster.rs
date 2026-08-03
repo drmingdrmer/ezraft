@@ -61,6 +61,8 @@ struct KvSm {
 impl EzApp for KvSm {
     type Request = Request;
     type Response = Response;
+    type ReadRequest = String;
+    type ReadResponse = Option<String>;
 
     async fn apply(&mut self, req: Request) -> Response {
         match req {
@@ -74,8 +76,8 @@ impl EzApp for KvSm {
         }
     }
 
-    fn read(&self, key: &str) -> Option<serde_json::Value> {
-        self.data.get(key).map(|value| serde_json::Value::String(value.clone()))
+    fn read(&self, key: String) -> Option<String> {
+        self.data.get(&key).cloned()
     }
 }
 
@@ -326,13 +328,16 @@ async fn join_promotes_to_voter_and_cluster_survives_leader_death() -> io::Resul
 
     // A direct read serves from local memory - no consensus round, no log
     // entry: the app's `read` answers the key from its own map.
-    let value: serde_json::Value = reqwest::get(format!("http://{}/api/read?key=k1", addr_a))
+    let value: Option<String> = reqwest::Client::new()
+        .post(format!("http://{}/api/read", addr_a))
+        .json("k1")
+        .send()
         .await
         .map_err(io::Error::other)?
         .json()
         .await
         .map_err(io::Error::other)?;
-    assert_eq!(serde_json::json!("v1"), value);
+    assert_eq!(Some("v1".to_string()), value);
 
     // Kill the leader; the two remaining voters still form a quorum.
     assert!(a.is_leader());

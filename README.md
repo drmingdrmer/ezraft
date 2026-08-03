@@ -38,7 +38,7 @@ cargo run --example kvstore -- --addr 127.0.0.1:8082 --seed 127.0.0.1:8080
 ```
 
 Each prints the node id the cluster gave it. Drive them from a fourth terminal - the
-request body is the example's `Request` enum as JSON:
+request bodies are the example's `Request` and `ReadRequest` enums as JSON:
 
 ```bash
 # A write goes through the log: replicated and committed before it answers.
@@ -47,8 +47,9 @@ curl -X POST 127.0.0.1:8080/api/write -H 'Content-Type: application/json' \
 # {"value":null}  - Set answers with the value it replaced, if there was one
 
 # A read is answered from that node's memory: no consensus round, no log entry.
-curl '127.0.0.1:8082/api/read?key=hello'
-# "world"  - from a node you never wrote to
+curl -X POST 127.0.0.1:8082/api/read -H 'Content-Type: application/json' \
+    -d '{"Get": {"key": "hello"}}'
+# {"hello":"world"}  - from a node you never wrote to
 
 # Any node accepts a write; a follower forwards it to the leader.
 curl -X POST 127.0.0.1:8081/api/write -H 'Content-Type: application/json' \
@@ -157,6 +158,8 @@ struct KvApp {
 impl EzApp for KvApp {
     type Request = Request;
     type Response = Response;
+    type ReadRequest = String;
+    type ReadResponse = Option<String>;
 
     /// Called once per committed entry, in log order, on every node.
     async fn apply(&mut self, req: Request) -> Response {
@@ -167,9 +170,10 @@ impl EzApp for KvApp {
         }
     }
 
-    /// Optional: answers `GET /api/read?key=...` from local state.
-    fn read(&self, key: &str) -> Option<serde_json::Value> {
-        self.data.get(key).map(|v| serde_json::Value::String(v.clone()))
+    /// Answers `POST /api/read` from local state. A read never enters the
+    /// log, so its request type is the app's own to shape.
+    fn read(&self, key: String) -> Option<String> {
+        self.data.get(&key).cloned()
     }
 }
 
@@ -209,11 +213,13 @@ so there is nothing to implement for them.
 pub trait EzApp: Serialize + DeserializeOwned + Send + Sync + 'static {
     type Request: ...;
     type Response: ...;
+    type ReadRequest: ...;
+    type ReadResponse: ...;
 
     async fn apply(&mut self, req: Self::Request) -> Self::Response;
 
-    // Optional; powers GET /api/read?key=..., declines every key by default.
-    fn read(&self, key: &str) -> Option<serde_json::Value> { None }
+    // Powers POST /api/read. An app with nothing to expose answers `()`.
+    fn read(&self, req: Self::ReadRequest) -> Self::ReadResponse;
 }
 ```
 
@@ -302,7 +308,7 @@ EzRaft includes built-in HTTP endpoints:
 - **Raft RPC** (`/raft/*`): Internal consensus communication
 - **Admin API** (`/api/node_id`, `/api/membership`, `/api/metrics`): `node_id` hands out an id, `membership` adds a node, changes its role or removes it - tagged by `op`, so `{"op": "Add", "node_id": 2, "addr": "..."}`, `{"op": "SetRole", "node_id": 2, "role": "Voter"}` or `{"op": "Remove", "node_id": 2}`. Joining is an id then two membership changes: enter as a learner, then ask for the voter role. One endpoint for all three because they are one decision made in stages - whether a node is a member, and whether it counts towards a quorum. Each answers either the result or the address of the leader to ask instead.
 - **Application API** (`POST /api/write`): Propose client requests, using your request type as JSON
-- **Application read** (`GET /api/read?key=...`): A keyed read answered by the app's `read` method from local memory, without a consensus round. An unknown key is a 404.
+- **Application read** (`POST /api/read`): A read answered by the app's `read` method from local memory, without a consensus round. Body and answer are the app's own read types, so a read is not confined to what a key-and-value write API can phrase - `examples/kvstore.rs` serves both a keyed lookup and a prefix scan through it. What "nothing found" means is the app's to define; the framework does not interpret the answer.
 
 `ezraft::admin::AdminClient` is the admin API from Rust rather than from `curl`: it follows the redirect to the leader and retries what a cluster that is still starting up fails at, which is how `EzRaft::join` joins.
 

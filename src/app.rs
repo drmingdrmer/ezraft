@@ -45,6 +45,8 @@ use serde::de::DeserializeOwned;
 /// impl EzApp for KvApp {
 ///     type Request = Request;
 ///     type Response = Response;
+///     type ReadRequest = String;
+///     type ReadResponse = Option<String>;
 ///
 ///     async fn apply(&mut self, req: Request) -> Response {
 ///         match req {
@@ -56,8 +58,8 @@ use serde::de::DeserializeOwned;
 ///         }
 ///     }
 ///
-///     fn read(&self, key: &str) -> Option<serde_json::Value> {
-///         self.data.get(key).map(|v| serde_json::Value::String(v.clone()))
+///     fn read(&self, key: String) -> Option<String> {
+///         self.data.get(&key).cloned()
 ///     }
 /// }
 /// ```
@@ -76,6 +78,18 @@ pub trait EzApp: Serialize + DeserializeOwned + Send + Sync + 'static {
     /// forwarded the write, hence the serde bounds.
     type Response: Serialize + for<'de> Deserialize<'de> + Send + Sync + 'static;
 
+    /// Read request type
+    ///
+    /// A read never enters the log, so this type answers to nothing but the app: a key, a range,
+    /// a query, whatever the state can be asked. It arrives as the JSON body of
+    /// `POST /api/read`, hence serde.
+    type ReadRequest: DeserializeOwned + Send + 'static;
+
+    /// Read response type
+    ///
+    /// What [`read`](Self::read) produced, serialized back to the caller.
+    type ReadResponse: Serialize + Send + 'static;
+
     /// Apply a committed request to the state machine
     ///
     /// This is where your business logic goes. A request arrives here only once it is
@@ -85,14 +99,13 @@ pub trait EzApp: Serialize + DeserializeOwned + Send + Sync + 'static {
     /// entry.
     async fn apply(&mut self, req: Self::Request) -> Self::Response;
 
-    /// Answer a keyed read against the local state
+    /// Answer a read against the local state
     ///
-    /// Powers `GET /api/read?key=...`: the write API puts keys in, this reads one back. What a
-    /// "key" means is the app's to define; return `None` for a key the app does not hold (a
-    /// 404 over HTTP). Answer from your own data structures - an indexed lookup, not a scan of
-    /// the serialized state.
+    /// Powers `POST /api/read`: the write API puts state in, this reads it back. Answer from your
+    /// own data structures - an indexed lookup, not a scan of the serialized state. What counts
+    /// as "nothing found" is the response type's to say, and the framework does not read it.
     ///
-    /// An app with nothing to expose this way returns `None` for every key; there is no default,
-    /// so that declining is a decision the app states rather than one it inherits.
-    fn read(&self, key: &str) -> Option<serde_json::Value>;
+    /// An app with nothing to expose this way answers `()`; there is no default, so that
+    /// declining is a decision the app states rather than one it inherits.
+    fn read(&self, req: Self::ReadRequest) -> Self::ReadResponse;
 }
