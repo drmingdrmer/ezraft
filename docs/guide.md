@@ -215,6 +215,14 @@ pub trait EzApp: Serialize + DeserializeOwned + Send + Sync + 'static {
 
 **You handle**: Business logic
 
+`apply` runs more than once for the same entry: a restart resumes applying from the last
+snapshot, so everything after it is applied again - the whole retained log on a node that
+never took one. The state that comes out is the same; anything else the method did happens
+again. So touch nothing but the state, and read nothing but the request and the state - no
+mail, no charge, no other database, no clock, no random number. Whatever has to reach the
+outside world goes after `write` returns, where it happens once per call instead of once
+per apply.
+
 Because a snapshot is the whole state serialized, the state has to fit in memory. That
 suits the coordination/metadata class of application (ZooKeeper snapshots the same way);
 an application whose snapshot is a streamed checkpoint of something larger builds on

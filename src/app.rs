@@ -85,8 +85,27 @@ pub trait EzApp: Serialize + DeserializeOwned + Send + Sync + 'static {
     /// This is where your business logic goes. A request arrives here only once it is
     /// committed - stored by a majority of the nodes, and past the point of being lost - and
     /// every node applies the same requests in the same order, which is what keeps their state
-    /// identical. The method is called sequentially, in log order, exactly once per committed
-    /// entry.
+    /// identical. The method is called sequentially, in log order.
+    ///
+    /// # Deterministic, and safe to run again
+    ///
+    /// One entry reaches this method more than once. A restart resumes applying from the last
+    /// snapshot, so every entry after it is applied again - the whole retained log, on a node
+    /// that never took one. It is the same request against the same state, so the state that
+    /// comes out is the same; what is not the same is anything the method did besides.
+    ///
+    /// - **Touch nothing but `self`.** Sending a mail, charging a card, publishing a message or
+    ///   writing to another database happens again on every replay, and on every node besides. Do
+    ///   that after [`write`](crate::EzRaft::write) returns, where it happens once per call instead
+    ///   of once per apply.
+    /// - **Read nothing but `req` and `self`.** A clock, a random number, an environment variable
+    ///   or a counter living outside the state makes two nodes compute two different states from
+    ///   one log. Nothing detects the divergence, and whichever node's snapshot is installed next
+    ///   overwrites the others with its version. Put the timestamp in the request, where the log
+    ///   carries it to every node.
+    ///
+    /// The `async` signature is for state that has to be awaited - a lock, a channel - not an
+    /// invitation to do I/O here.
     async fn apply(&mut self, req: Self::Request) -> Self::Response;
 
     /// Read request type
