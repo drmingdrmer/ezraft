@@ -32,6 +32,10 @@ tokio       = { version = "1.39", default-features = false, features = ["fs", "m
 clap               = { version = "4.1.11", features = ["derive", "env"] }
 tracing-subscriber = { version = "0.3.3", features = ["env-filter"] }
 
+[[test]]
+name = "kvstore_example"
+path = "examples/tests/kvstore.rs"
+
 [profile.release]
 debug = 2
 split-debuginfo = "packed"
