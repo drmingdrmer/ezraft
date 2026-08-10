@@ -281,7 +281,6 @@ mod tests {
             meta: EzSnapshotMeta {
                 last_log_id: Some(last_log_id),
                 last_membership: StoredMembership::new(Some(last_log_id), Membership::default()),
-                snapshot_id: format!("1-{}", index),
             },
             snapshot: Cursor::new(data.to_vec()),
         }

@@ -17,7 +17,7 @@ repository    = "https://github.com/drmingdrmer/ezraft"
 # alphas, and this crate implements its storage, network and type-config
 # traits. A caret requirement would let a downstream `cargo update` pull an
 # incompatible alpha into a build of ezraft that never changed.
-openraft = { version = "=0.10.0-alpha.32", features = ["serde", "type-alias"] }
+openraft = { version = "=0.10.0-alpha.33", features = ["serde", "type-alias"] }
 
 actix-web   = { version = "4.0" }
 async-trait = { version = "0.1" }

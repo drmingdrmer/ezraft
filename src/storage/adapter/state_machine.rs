@@ -219,15 +219,9 @@ where T: EzApp
             (sm.last_applied, sm.membership.clone(), data)
         };
 
-        let snapshot_id = match last_applied {
-            Some(log_id) => format!("{}-{}", log_id.leader_id.term, log_id.index),
-            None => "0-0".to_string(),
-        };
-
         let snapshot_meta = SnapshotMeta {
             last_log_id: last_applied,
             last_membership,
-            snapshot_id,
         };
 
         // Persist before returning: openraft purges logs covered by this snapshot right after,
@@ -327,7 +321,6 @@ mod tests {
         EzSnapshotMeta {
             last_log_id: Some(last_log_id),
             last_membership: StoredMembership::new(Some(last_log_id), Membership::default()),
-            snapshot_id: format!("1-{}", index),
         }
     }
 
