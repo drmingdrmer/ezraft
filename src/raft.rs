@@ -501,8 +501,17 @@ where T: EzApp
     /// address says so immediately, instead of waiting out a promotion that was never going to
     /// arrive without it.
     pub async fn serve(self) -> Result<(), io::Error> {
+        self.serve_with(|_| {}).await
+    }
+
+    /// Start the HTTP server with application-specific routes
+    ///
+    /// The closure extends the bundled server with routes backed by the same EzRaft.
+    /// Standard Raft, application, and admin routes are installed first and cannot be replaced.
+    pub async fn serve_with<F>(self, configure: F) -> Result<(), io::Error>
+    where F: Fn(&mut actix_web::web::ServiceConfig) + Clone + Send + 'static {
         let promotion = self.promotion.lock().unwrap().take();
-        let mut server = tokio::spawn(crate::server::run(self));
+        let mut server = tokio::spawn(crate::server::run_with(self, configure));
 
         if let Some(mut promotion) = promotion {
             // The two are raced rather than collected in turn. A promotion completes only once

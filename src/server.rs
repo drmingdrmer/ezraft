@@ -11,6 +11,7 @@ use actix_web::App;
 use actix_web::HttpServer;
 use actix_web::web;
 use actix_web::web::Data;
+use actix_web::web::ServiceConfig;
 use openraft::Snapshot;
 use openraft::errors::ClientWriteError;
 use openraft::errors::Infallible;
@@ -56,10 +57,17 @@ where T: EzApp
 
     /// Run the HTTP server
     pub async fn run(self) -> std::io::Result<()> {
+        self.run_with(|_| {}).await
+    }
+
+    /// Run the HTTP server with application-specific routes
+    async fn run_with<F>(self, configure: F) -> std::io::Result<()>
+    where F: Fn(&mut ServiceConfig) + Clone + Send + 'static {
         let addr = self.raft.addr().to_string();
         let server_data = Data::new(self);
 
         let server = HttpServer::new(move || {
+            let configure = configure.clone();
             App::new()
                 .app_data(server_data.clone())
                 // Raft internal RPC
@@ -74,6 +82,7 @@ where T: EzApp
                 .route("/api/node_id", web::post().to(Self::handle_node_id))
                 .route("/api/membership", web::post().to(Self::handle_membership))
                 .route("/api/metrics", web::get().to(Self::handle_metrics))
+                .configure(configure)
         })
         .bind(&addr)?;
 
@@ -334,10 +343,12 @@ where T: EzApp
     }
 }
 
-/// Run the HTTP server (convenience function)
-pub(crate) async fn run<T>(raft: EzRaft<T>) -> std::io::Result<()>
-where T: EzApp {
-    EzServer::new(raft).run().await
+pub(crate) async fn run_with<T, F>(raft: EzRaft<T>, configure: F) -> std::io::Result<()>
+where
+    T: EzApp,
+    F: Fn(&mut ServiceConfig) + Clone + Send + 'static,
+{
+    EzServer::new(raft).run_with(configure).await
 }
 
 /// How long to wait for an election to settle before giving up on writing
