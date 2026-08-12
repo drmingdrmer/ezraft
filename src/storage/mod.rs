@@ -31,8 +31,8 @@ use crate::entry::EzEntry;
 ///
 /// - **Durability.** [`persist`] must return only once the data would survive a crash of the
 ///   machine, not just of the process. Anything weaker means a node can forget a vote it cast or a
-///   log entry it acknowledged. The bundled [`FileStorage`] writes files without `fsync`, which is
-///   fine for a demo and not enough for a real deployment.
+///   log entry it acknowledged. Reaching that takes an `fsync` of the file and another of the
+///   directory naming it, which is what the bundled [`FileStorage`] does.
 /// - **Ordering.** Operations are applied in the order [`persist`] receives them. A later one must
 ///   not become durable before an earlier one.
 /// - **Read-your-writes.** [`read_logs`] returns what [`persist`] last wrote, including the
