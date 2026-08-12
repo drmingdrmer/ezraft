@@ -7,10 +7,12 @@ use std::collections::BTreeSet;
 use std::io;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::time::Duration;
 
 use openraft::BasicNode;
 use openraft::ChangeMembers;
 use openraft::Raft;
+use openraft::RaftMetrics;
 use openraft::ReadPolicy;
 use openraft::async_runtime::WatchReceiver;
 use openraft::errors::InitializeError;
@@ -21,6 +23,7 @@ use crate::admin::AdminClient;
 use crate::admin::MembershipChange;
 use crate::app::EzApp;
 use crate::config::EzConfig;
+use crate::entry::EzLogId;
 use crate::network::EzNetworkFactory;
 use crate::node_role::NodeRole;
 use crate::storage::EzStorage;
@@ -339,18 +342,26 @@ where T: EzApp
 
     /// Wait until a local read would be linearizable
     ///
-    /// Confirms this node is still the leader with a quorum round-trip, then waits until the
-    /// local state machine has applied everything committed up to that point. A [`Self::read`]
-    /// issued after this returns sees every write acknowledged before this call.
+    /// Confirms this node still leads, then waits until the local state machine has applied
+    /// everything committed up to that point. A [`Self::read`] issued after this returns sees
+    /// every write acknowledged before this call.
     ///
     /// Only the leader can serve linearizable reads, so on a follower this returns an error
     /// instead of forwarding: forwarding cannot make this node's local state current.
-    pub async fn linearizable(&self) -> Result<(), io::Error> {
-        self.raft
-            .ensure_linearizable(ReadPolicy::ReadIndex)
-            .await
-            .map_err(|e| io::Error::other(e.to_string()))?;
-        Ok(())
+    ///
+    /// `policy` chooses how leadership is confirmed. [`ReadPolicy::ReadIndex`] asks a quorum and
+    /// is correct whatever the clocks do; [`ReadPolicy::LeaseRead`] answers from the leader lease
+    /// with no round trip, and trades that cost for the assumption that clock drift between nodes
+    /// stays inside the lease.
+    ///
+    /// Returns the log id the read is anchored to: its term identifies the leadership that
+    /// granted the read, which is what a caller comparing two reads across a leader change needs.
+    pub async fn linearizable(&self, policy: ReadPolicy) -> Result<EzLogId, io::Error> {
+        let read_log_id = self.raft.ensure_linearizable(policy).await.map_err(|e| io::Error::other(e.to_string()))?;
+
+        let term = read_log_id.committed_leader_id().term;
+        let index = read_log_id.index();
+        Ok((term, index))
     }
 
     /// Add a learner node to the cluster
@@ -476,8 +487,60 @@ where T: EzApp
     /// Get the current cluster metrics
     ///
     /// Returns information about the Raft cluster state.
-    pub async fn metrics(&self) -> openraft::RaftMetrics<ORTypes<T>> {
+    pub async fn metrics(&self) -> RaftMetrics<ORTypes<T>> {
         self.raft.metrics().borrow_watched().clone()
+    }
+
+    /// Wait until this node's metrics satisfy `predicate`, and return the metrics that did
+    ///
+    /// The condition is checked against every metrics update, so it must describe a state to wait
+    /// for rather than an event to catch. `timeout` bounds the wait, and `None` waits without one.
+    /// `reason` names what is being waited for, and is what the error and openraft's own logs
+    /// report.
+    pub async fn wait_metrics<P>(
+        &self,
+        timeout: Option<Duration>,
+        predicate: P,
+        reason: &str,
+    ) -> Result<RaftMetrics<ORTypes<T>>, io::Error>
+    where
+        P: Fn(&RaftMetrics<ORTypes<T>>) -> bool + Send,
+    {
+        self.raft.wait(timeout).metrics(predicate, reason).await.map_err(io::Error::other)
+    }
+
+    /// Take a snapshot of the state machine now, rather than at the next configured threshold
+    ///
+    /// Returns once the snapshot is scheduled, not once it exists: wait on
+    /// [`Self::wait_metrics`] for `snapshot` to reach the log id in question.
+    pub async fn trigger_snapshot(&self) -> Result<(), io::Error> {
+        self.raft.trigger().snapshot().await.map_err(io::Error::other)
+    }
+
+    /// Delete log entries up to and including `upto_index`
+    ///
+    /// Only entries a snapshot already covers may be purged; openraft holds the request until
+    /// that is true rather than refusing it. Purging is what bounds the log on disk, since a
+    /// snapshot alone only makes the entries below it redundant.
+    pub async fn purge_log(&self, upto_index: u64) -> Result<(), io::Error> {
+        self.raft.trigger().purge_log(upto_index).await.map_err(io::Error::other)
+    }
+
+    /// Ask this leader to hand leadership to `node_id`
+    ///
+    /// Returns once the handover is under way. The target has to be caught up enough to win the
+    /// election that follows, so leadership moves some time after this returns, and a caller that
+    /// depends on it waits for the new leader through [`Self::wait_metrics`].
+    pub async fn transfer_leader(&self, node_id: u64) -> Result<(), io::Error> {
+        self.raft.trigger().transfer_leader(node_id).await.map_err(io::Error::other)
+    }
+
+    /// Stop this node's Raft engine and wait for it to finish
+    ///
+    /// The HTTP server started by [`Self::serve`] is separate and keeps running, so a caller
+    /// stopping a whole node stops that too.
+    pub async fn shutdown(&self) -> Result<(), io::Error> {
+        self.raft.shutdown().await.map_err(io::Error::other)
     }
 
     /// Start the HTTP server

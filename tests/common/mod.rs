@@ -223,14 +223,12 @@ pub async fn founding_node() -> io::Result<(String, EzRaft<KvSm>)> {
     // Leading is not enough. `create` writes the founding membership and winning the election
     // does not commit it, so a caller that changes the membership next is refused for having one
     // already in flight - which is a race it loses only under load.
-    node.inner()
-        .wait(WAIT)
-        .metrics(
-            |m| m.current_leader == Some(0) && m.committed_membership_config.log_id().is_some(),
-            "founding node leads, with its own membership committed",
-        )
-        .await
-        .map_err(io::Error::other)?;
+    node.wait_metrics(
+        WAIT,
+        |m| m.current_leader == Some(0) && m.committed_membership_config.log_id().is_some(),
+        "founding node leads, with its own membership committed",
+    )
+    .await?;
     Ok((addr, node))
 }
 
@@ -258,14 +256,12 @@ pub async fn joined_learner(seed: &str) -> io::Result<(String, EzRaft<KvSm>)> {
 /// not joint: a joint config still counts the old voter set, so a test that
 /// killed a node on the strength of it would be racing.
 pub async fn wait_for_voters(node: &EzRaft<KvSm>, voters: BTreeSet<u64>, reason: &str) -> io::Result<()> {
-    node.inner()
-        .wait(WAIT)
-        .metrics(
-            |m| *m.committed_membership_config.membership().get_joint_config() == [voters.clone()],
-            reason,
-        )
-        .await
-        .map_err(io::Error::other)?;
+    node.wait_metrics(
+        WAIT,
+        |m| *m.committed_membership_config.membership().get_joint_config() == [voters.clone()],
+        reason,
+    )
+    .await?;
     Ok(())
 }
 
@@ -276,14 +272,12 @@ pub async fn wait_for_voters(node: &EzRaft<KvSm>, voters: BTreeSet<u64>, reason:
 /// those two would pass instantly.
 pub async fn wait_for_applied(node: &EzRaft<KvSm>, leader: &EzRaft<KvSm>) -> io::Result<()> {
     let target = leader.metrics().await.last_log_index.expect("the leader has written entries");
-    node.inner()
-        .wait(WAIT)
-        .metrics(
-            |m| m.last_applied.map(|log_id| log_id.index) >= Some(target),
-            "applied the leader's log",
-        )
-        .await
-        .map_err(io::Error::other)?;
+    node.wait_metrics(
+        WAIT,
+        |m| m.last_applied.map(|log_id| log_id.index) >= Some(target),
+        "applied the leader's log",
+    )
+    .await?;
     Ok(())
 }
 

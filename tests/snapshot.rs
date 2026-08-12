@@ -11,6 +11,7 @@ use std::io;
 use common::*;
 use ezraft::EzConfig;
 use ezraft::EzRaft;
+use ezraft::ReadPolicy;
 
 /// A snapshot must land on disk when built, and a restarted node must rebuild
 /// the full state from that snapshot plus the log entries after it.
@@ -20,22 +21,14 @@ async fn snapshot_survives_restart() -> io::Result<()> {
     let storage = MemStorage::default();
 
     let a = EzRaft::create(&addr, KvSm::default(), storage.clone(), config()).await?;
-    a.inner()
-        .wait(WAIT)
-        .metrics(|m| m.current_leader == Some(0), "single node leads")
-        .await
-        .map_err(io::Error::other)?;
+    a.wait_metrics(WAIT, |m| m.current_leader == Some(0), "single node leads").await?;
 
     for i in 0..10 {
         a.write(set(&format!("k{}", i), &format!("v{}", i))).await?;
     }
 
-    a.inner().trigger().snapshot().await.map_err(io::Error::other)?;
-    a.inner()
-        .wait(WAIT)
-        .metrics(|m| m.snapshot.is_some(), "snapshot built")
-        .await
-        .map_err(io::Error::other)?;
+    a.trigger_snapshot().await?;
+    a.wait_metrics(WAIT, |m| m.snapshot.is_some(), "snapshot built").await?;
 
     // The snapshot must be on disk with the full applied state: a restart
     // reads only the disk, so an unpersisted snapshot is lost data.
@@ -52,30 +45,23 @@ async fn snapshot_survives_restart() -> io::Result<()> {
         a.write(set(&format!("k{}", i), &format!("v{}", i))).await?;
     }
 
-    a.inner().shutdown().await.map_err(io::Error::other)?;
+    a.shutdown().await?;
     drop(a);
 
     // Restart on the same disk with an empty state machine.
     let restarted = EzRaft::create(&addr, KvSm::default(), storage.clone(), config()).await?;
+    restarted.wait_metrics(WAIT, |m| m.current_leader == Some(0), "restarted node leads").await?;
     restarted
-        .inner()
-        .wait(WAIT)
-        .metrics(|m| m.current_leader == Some(0), "restarted node leads")
-        .await
-        .map_err(io::Error::other)?;
-    restarted
-        .inner()
-        .wait(WAIT)
-        .metrics(
+        .wait_metrics(
+            WAIT,
             |m| m.last_applied.map(|log_id| log_id.index) == m.last_log_index,
             "log tail replayed",
         )
-        .await
-        .map_err(io::Error::other)?;
+        .await?;
 
     // After the linearizable barrier, a local read must serve every write
     // acknowledged before the shutdown.
-    restarted.linearizable().await?;
+    restarted.linearizable(ReadPolicy::ReadIndex).await?;
     assert_eq!(expected_map(0..15), restarted.read(|app| app.data.clone()).await?);
 
     // And the restarted node serves reads over the rebuilt state.
@@ -98,22 +84,14 @@ async fn a_restart_reapplies_the_entries_after_the_snapshot() -> io::Result<()> 
     let storage = MemStorage::default();
 
     let a = EzRaft::create(&addr, tagged("replay"), storage.clone(), config()).await?;
-    a.inner()
-        .wait(WAIT)
-        .metrics(|m| m.current_leader == Some(0), "single node leads")
-        .await
-        .map_err(io::Error::other)?;
+    a.wait_metrics(WAIT, |m| m.current_leader == Some(0), "single node leads").await?;
 
     for i in 0..10 {
         a.write(set(&format!("k{}", i), &format!("v{}", i))).await?;
     }
 
-    a.inner().trigger().snapshot().await.map_err(io::Error::other)?;
-    a.inner()
-        .wait(WAIT)
-        .metrics(|m| m.snapshot.is_some(), "snapshot built")
-        .await
-        .map_err(io::Error::other)?;
+    a.trigger_snapshot().await?;
+    a.wait_metrics(WAIT, |m| m.snapshot.is_some(), "snapshot built").await?;
 
     // These land after the snapshot, so they are the ones a restart has to replay.
     for i in 10..15 {
@@ -123,27 +101,20 @@ async fn a_restart_reapplies_the_entries_after_the_snapshot() -> io::Result<()> 
     let first_run: Vec<String> = (0..15).map(|i| format!("Set(k{})", i)).collect();
     assert_eq!(first_run, applied("replay"), "each write applied once while running");
 
-    a.inner().shutdown().await.map_err(io::Error::other)?;
+    a.shutdown().await?;
     drop(a);
 
     // Restart on the same disk with an empty state machine: the snapshot restores the state up
     // to k9, and the log carries k10..k15 back through `apply`.
     let restarted = EzRaft::create(&addr, tagged("replay"), storage.clone(), config()).await?;
+    restarted.wait_metrics(WAIT, |m| m.current_leader == Some(0), "restarted node leads").await?;
     restarted
-        .inner()
-        .wait(WAIT)
-        .metrics(|m| m.current_leader == Some(0), "restarted node leads")
-        .await
-        .map_err(io::Error::other)?;
-    restarted
-        .inner()
-        .wait(WAIT)
-        .metrics(
+        .wait_metrics(
+            WAIT,
             |m| m.last_applied.map(|log_id| log_id.index) == m.last_log_index,
             "log tail replayed",
         )
-        .await
-        .map_err(io::Error::other)?;
+        .await?;
 
     let replayed: Vec<String> = (10..15).map(|i| format!("Set(k{})", i)).collect();
     assert_eq!(
@@ -169,11 +140,7 @@ async fn lagging_joiner_catches_up_from_snapshot() -> io::Result<()> {
         let a = a.clone();
         async move { a.serve().await }
     });
-    a.inner()
-        .wait(WAIT)
-        .metrics(|m| m.current_leader == Some(0), "founding node leads")
-        .await
-        .map_err(io::Error::other)?;
+    a.wait_metrics(WAIT, |m| m.current_leader == Some(0), "founding node leads").await?;
 
     for i in 0..10 {
         a.write(set(&format!("k{}", i), &format!("v{}", i))).await?;
@@ -181,25 +148,16 @@ async fn lagging_joiner_catches_up_from_snapshot() -> io::Result<()> {
 
     // Snapshot, then purge every covered entry: whoever joins now cannot be
     // caught up by log replay.
-    a.inner().trigger().snapshot().await.map_err(io::Error::other)?;
-    let snapshot_index = a
-        .inner()
-        .wait(WAIT)
-        .metrics(|m| m.snapshot.is_some(), "snapshot built")
-        .await
-        .map_err(io::Error::other)?
-        .snapshot
-        .unwrap()
-        .index;
-    a.inner().trigger().purge_log(snapshot_index).await.map_err(io::Error::other)?;
-    a.inner()
-        .wait(WAIT)
-        .metrics(
-            |m| m.purged.map(|log_id| log_id.index) == Some(snapshot_index),
-            "log purged up to the snapshot",
-        )
-        .await
-        .map_err(io::Error::other)?;
+    a.trigger_snapshot().await?;
+    let snapshot_index =
+        a.wait_metrics(WAIT, |m| m.snapshot.is_some(), "snapshot built").await?.snapshot.unwrap().index;
+    a.purge_log(snapshot_index).await?;
+    a.wait_metrics(
+        WAIT,
+        |m| m.purged.map(|log_id| log_id.index) == Some(snapshot_index),
+        "log purged up to the snapshot",
+    )
+    .await?;
 
     let addr_b = free_addr();
     let b = EzRaft::join(&addr_b, &addr_a, KvSm::default(), MemStorage::default(), config()).await?;
@@ -239,25 +197,19 @@ async fn automatic_snapshot_purges_old_logs() -> io::Result<()> {
         ..config()
     };
     let a = EzRaft::create(&addr, KvSm::default(), storage.clone(), config).await?;
-    a.inner()
-        .wait(WAIT)
-        .metrics(|m| m.current_leader == Some(0), "single node leads")
-        .await
-        .map_err(io::Error::other)?;
+    a.wait_metrics(WAIT, |m| m.current_leader == Some(0), "single node leads").await?;
 
     for i in 0..12 {
         a.write(set(&format!("k{}", i), &format!("v{}", i))).await?;
     }
 
     let metrics = a
-        .inner()
-        .wait(WAIT)
-        .metrics(
+        .wait_metrics(
+            WAIT,
             |m| m.snapshot.is_some() && m.purged.is_some(),
             "snapshot built and log purged by the interval policy alone",
         )
-        .await
-        .map_err(io::Error::other)?;
+        .await?;
 
     let disk = storage.disk.lock().unwrap();
     let (meta, data) = disk.snapshot.as_ref().expect("snapshot persisted to storage");
@@ -305,25 +257,16 @@ async fn restart_after_a_snapshot_with_no_log_after_it() -> io::Result<()> {
     }
 
     // Snapshot at `a`'s last entry and purge everything it covers.
-    a.inner().trigger().snapshot().await.map_err(io::Error::other)?;
-    let snapshot_index = a
-        .inner()
-        .wait(WAIT)
-        .metrics(|m| m.snapshot.is_some(), "snapshot built")
-        .await
-        .map_err(io::Error::other)?
-        .snapshot
-        .unwrap()
-        .index;
-    a.inner().trigger().purge_log(snapshot_index).await.map_err(io::Error::other)?;
-    a.inner()
-        .wait(WAIT)
-        .metrics(
-            |m| m.purged.map(|log_id| log_id.index) == Some(snapshot_index),
-            "log purged up to the snapshot",
-        )
-        .await
-        .map_err(io::Error::other)?;
+    a.trigger_snapshot().await?;
+    let snapshot_index =
+        a.wait_metrics(WAIT, |m| m.snapshot.is_some(), "snapshot built").await?.snapshot.unwrap().index;
+    a.purge_log(snapshot_index).await?;
+    a.wait_metrics(
+        WAIT,
+        |m| m.purged.map(|log_id| log_id.index) == Some(snapshot_index),
+        "log purged up to the snapshot",
+    )
+    .await?;
     assert_eq!(
         Some(snapshot_index),
         a.metrics().await.last_log_index,
@@ -346,7 +289,7 @@ async fn restart_after_a_snapshot_with_no_log_after_it() -> io::Result<()> {
     // Opening the store again is the real check: it is where openraft reads
     // both positions back and refuses an inverted pair. A fresh address because
     // this node is only constructed, never served.
-    c.inner().shutdown().await.map_err(io::Error::other)?;
+    c.shutdown().await?;
     drop(c);
     EzRaft::join_as_learner(&free_addr(), &addr_a, KvSm::default(), disk_c, config()).await?;
 

@@ -39,14 +39,12 @@ async fn admin_api_changes_roles_and_removes_nodes() -> io::Result<()> {
     );
 
     admin_post(&addr_a, serde_json::json!({"op": "Remove", "node_id": b_id})).await?;
-    a.inner()
-        .wait(WAIT)
-        .metrics(
-            |m| m.membership_config.membership().get_node(&b_id).is_none(),
-            "removed over HTTP",
-        )
-        .await
-        .map_err(io::Error::other)?;
+    a.wait_metrics(
+        WAIT,
+        |m| m.membership_config.membership().get_node(&b_id).is_none(),
+        "removed over HTTP",
+    )
+    .await?;
 
     Ok(())
 }

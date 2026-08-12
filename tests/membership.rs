@@ -21,11 +21,7 @@ async fn join_promotes_to_voter_and_cluster_survives_leader_death() -> io::Resul
         let a = a.clone();
         async move { a.serve().await }
     });
-    a.inner()
-        .wait(WAIT)
-        .metrics(|m| m.current_leader == Some(0), "founding node leads")
-        .await
-        .map_err(io::Error::other)?;
+    a.wait_metrics(WAIT, |m| m.current_leader == Some(0), "founding node leads").await?;
 
     let addr_b = free_addr();
     let b = EzRaft::join(&addr_b, &addr_a, KvSm::default(), MemStorage::default(), config()).await?;
@@ -66,16 +62,14 @@ async fn join_promotes_to_voter_and_cluster_survives_leader_death() -> io::Resul
 
     // Kill the leader; the two remaining voters still form a quorum.
     assert!(a.is_leader());
-    a.inner().shutdown().await.map_err(io::Error::other)?;
+    a.shutdown().await?;
 
-    b.inner()
-        .wait(WAIT)
-        .metrics(
-            |m| matches!(m.current_leader, Some(id) if id != 0),
-            "a surviving node takes over",
-        )
-        .await
-        .map_err(io::Error::other)?;
+    b.wait_metrics(
+        WAIT,
+        |m| matches!(m.current_leader, Some(id) if id != 0),
+        "a surviving node takes over",
+    )
+    .await?;
 
     // The new leader accepts writes (reached from a follower via forwarding)
     // and still has the data acknowledged before the failover.
@@ -106,11 +100,7 @@ async fn learner_joins_and_stays_a_learner_until_promoted() -> io::Result<()> {
         let a = a.clone();
         async move { a.serve().await }
     });
-    a.inner()
-        .wait(WAIT)
-        .metrics(|m| m.current_leader == Some(0), "founding node leads")
-        .await
-        .map_err(io::Error::other)?;
+    a.wait_metrics(WAIT, |m| m.current_leader == Some(0), "founding node leads").await?;
 
     let addr_b = free_addr();
     let b = EzRaft::join_as_learner(&addr_b, &addr_a, KvSm::default(), MemStorage::default(), config()).await?;
@@ -130,14 +120,12 @@ async fn learner_joins_and_stays_a_learner_until_promoted() -> io::Result<()> {
     // replicated nothing yet has its own `last_applied` and `last_log_index`
     // both unset, and comparing those two would pass instantly.
     let target = a.metrics().await.last_log_index.expect("the leader has written entries");
-    b.inner()
-        .wait(WAIT)
-        .metrics(
-            |m| m.last_applied.map(|log_id| log_id.index) >= Some(target),
-            "learner applied the leader's log",
-        )
-        .await
-        .map_err(io::Error::other)?;
+    b.wait_metrics(
+        WAIT,
+        |m| m.last_applied.map(|log_id| log_id.index) >= Some(target),
+        "learner applied the leader's log",
+    )
+    .await?;
 
     let metrics = a.metrics().await;
     let membership = metrics.membership_config.membership();

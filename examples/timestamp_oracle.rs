@@ -54,8 +54,8 @@ use ezraft::EzApp;
 use ezraft::EzConfig;
 use ezraft::EzRaft;
 use ezraft::FileStorage;
-use openraft::ReadPolicy;
-use openraft::ServerState;
+use ezraft::ReadPolicy;
+use ezraft::ServerState;
 use serde::Deserialize;
 use serde::Serialize;
 use tokio::sync::Mutex;
@@ -173,8 +173,8 @@ impl TimeService {
             // Returns at once while this node is already the leader, so a follower parks
             // here instead of waking every interval, and a fresh leader reserves as soon as
             // it is elected rather than up to one interval later.
-            let wait = self.raft.inner().wait(None);
-            if let Err(error) = wait.state(ServerState::Leader, "reserve timestamps").await {
+            let leads = self.raft.wait_metrics(None, |m| m.state == ServerState::Leader, "reserve timestamps");
+            if let Err(error) = leads.await {
                 error!("timestamp reservation task stopped: {error}");
                 return;
             }
@@ -205,13 +205,8 @@ impl TimeService {
     }
 
     async fn leader_term(&self) -> io::Result<u64> {
-        let read_log_id = self
-            .raft
-            .inner()
-            .ensure_linearizable(ReadPolicy::LeaseRead)
-            .await
-            .map_err(|error| io::Error::other(error.to_string()))?;
-        Ok(read_log_id.committed_leader_id().term)
+        let (term, _index) = self.raft.linearizable(ReadPolicy::LeaseRead).await?;
+        Ok(term)
     }
 }
 

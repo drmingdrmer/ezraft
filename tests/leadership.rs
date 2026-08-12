@@ -40,15 +40,13 @@ async fn demoted_leader_keeps_leading_outside_the_quorum() -> io::Result<()> {
     assert_eq!(Response { value: None }, http_write(&addr_a, set("k1", "v1")).await?);
 
     // And when it does go, the voters elect one of their own.
-    a.inner().shutdown().await.map_err(io::Error::other)?;
-    b.inner()
-        .wait(WAIT)
-        .metrics(
-            |m| matches!(m.current_leader, Some(id) if id != 0),
-            "a voter takes over from the demoted leader",
-        )
-        .await
-        .map_err(io::Error::other)?;
+    a.shutdown().await?;
+    b.wait_metrics(
+        WAIT,
+        |m| matches!(m.current_leader, Some(id) if id != 0),
+        "a voter takes over from the demoted leader",
+    )
+    .await?;
     assert_eq!(Response { value: None }, http_write(&addr_b, set("k2", "v2")).await?);
 
     Ok(())
@@ -70,13 +68,14 @@ async fn leadership_transfers_to_the_named_node() -> io::Result<()> {
     assert!(a.is_leader());
 
     let target = c.node_id();
-    a.inner().trigger().transfer_leader(target).await.map_err(io::Error::other)?;
+    a.transfer_leader(target).await?;
 
-    c.inner()
-        .wait(WAIT)
-        .metrics(|m| m.current_leader == Some(target), "the named node takes leadership")
-        .await
-        .map_err(io::Error::other)?;
+    c.wait_metrics(
+        WAIT,
+        |m| m.current_leader == Some(target),
+        "the named node takes leadership",
+    )
+    .await?;
 
     assert_eq!(Response { value: None }, http_write(&addr_c, set("k1", "v1")).await?);
 
@@ -97,14 +96,12 @@ async fn removed_leader_hands_over_leadership() -> io::Result<()> {
 
     a.remove_node(0).await?;
 
-    b.inner()
-        .wait(WAIT)
-        .metrics(
-            |m| matches!(m.current_leader, Some(id) if id != 0),
-            "leadership moves off the removed node",
-        )
-        .await
-        .map_err(io::Error::other)?;
+    b.wait_metrics(
+        WAIT,
+        |m| matches!(m.current_leader, Some(id) if id != 0),
+        "leadership moves off the removed node",
+    )
+    .await?;
 
     let voters = BTreeSet::from([b.node_id(), c.node_id()]);
     wait_for_voters(&b, voters.clone(), "the removed leader left the cluster").await?;
