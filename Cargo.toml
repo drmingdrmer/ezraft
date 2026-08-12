@@ -12,6 +12,11 @@ license       = "MIT OR Apache-2.0"
 readme        = "README.md"
 repository    = "https://github.com/drmingdrmer/ezraft"
 
+# Each example keeps its end-to-end test beside it, as `<example>_test.rs`, and
+# the two tests share `harness.rs`. Auto-discovery would take all three for
+# examples and fail to build them, so every example is declared below instead.
+autoexamples = false
+
 [dependencies]
 # Pinned exactly: openraft is a pre-release series that breaks API between
 # alphas, and this crate implements its storage, network and type-config
@@ -34,13 +39,21 @@ clap               = { version = "4.1.11", features = ["derive", "env"] }
 tracing            = { version = "0.1" }
 tracing-subscriber = { version = "0.3.3", features = ["env-filter"] }
 
-[[test]]
-name = "kvstore_example"
-path = "examples/tests/kvstore.rs"
+[[example]]
+name = "kvstore"
+path = "examples/kvstore.rs"
+
+[[example]]
+name = "timestamp_oracle"
+path = "examples/timestamp_oracle.rs"
 
 [[test]]
-name = "time_server_example"
-path = "examples/tests/time_server.rs"
+name = "kvstore_example"
+path = "examples/kvstore_test.rs"
+
+[[test]]
+name = "timestamp_oracle_example"
+path = "examples/timestamp_oracle_test.rs"
 
 [profile.release]
 debug = 2

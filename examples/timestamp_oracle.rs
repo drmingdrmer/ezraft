@@ -1,11 +1,11 @@
-//! Monotonic Unix timestamp server built on EzRaft.
+//! Monotonic Unix timestamp oracle built on EzRaft.
 //!
 //! Run three voting nodes so the service survives one node stopping:
 //!
 //! ~~~bash
-//! cargo run --example time_server -- --addr 127.0.0.1:8080
-//! cargo run --example time_server -- --addr 127.0.0.1:8081 --seed 127.0.0.1:8080
-//! cargo run --example time_server -- --addr 127.0.0.1:8082 --seed 127.0.0.1:8080
+//! cargo run --example timestamp_oracle -- --addr 127.0.0.1:8080
+//! cargo run --example timestamp_oracle -- --addr 127.0.0.1:8081 --seed 127.0.0.1:8080
+//! cargo run --example timestamp_oracle -- --addr 127.0.0.1:8082 --seed 127.0.0.1:8080
 //! ~~~
 //!
 //! Request a timestamp from the current leader:
@@ -239,7 +239,7 @@ async fn get_time(service: web::Data<TimeService>) -> Result<web::Json<String>, 
     Ok(web::Json(format_timestamp(micros)))
 }
 
-/// Command-line configuration for one time-server node.
+/// Command-line configuration for one timestamp oracle node.
 #[derive(Parser)]
 struct Args {
     /// HTTP bind address for Raft and application requests.
@@ -263,7 +263,7 @@ async fn main() -> io::Result<()> {
         .init();
 
     let args = Args::parse();
-    let data_dir = PathBuf::from(format!("./data/time-server/{}", args.addr.replace(':', "-")));
+    let data_dir = PathBuf::from(format!("./data/timestamp-oracle/{}", args.addr.replace(':', "-")));
     let storage = FileStorage::new(data_dir).await?;
     let config = EzConfig::default();
     let app = TimeState::default();
