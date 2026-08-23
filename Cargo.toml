@@ -24,7 +24,12 @@ autoexamples = false
 # incompatible alpha into a build of ezraft that never changed.
 openraft = { version = "=0.10.0-alpha.33", features = ["serde", "type-alias"] }
 
-actix-web   = { version = "4.0" }
+# No default features: one of them is `http2`, which pulls in h2 0.3 through
+# actix-http 3.x (still on `http` 0.2). h2 patched RUSTSEC-2026-0258 only in
+# 0.4.16, so that path fails `cargo audit`. Raft traffic here is HTTP/1.1 over
+# plain `http://`, and this crate uses none of the other default features, so
+# dropping the whole set costs nothing.
+actix-web   = { version = "4.0", default-features = false }
 async-trait = { version = "0.1" }
 derive_more = { version = "2.1.1", features = ["display"] }
 futures     = { version = "0.3" }
